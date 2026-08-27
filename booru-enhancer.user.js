@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.1.1
+// @version      1.2.5
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -61,33 +61,33 @@
 
 /**
  * =============================================================================
- *  BOORU ENHANCER  —  v1.1.1
+ *  BOORU ENHANCER  —  v1.2.5
  * =============================================================================
- *  CHANGELOG (1.1.0 → 1.1.1)
+ *  CHANGELOG (1.1.2 → 1.2.5)
  *  --------------------------
- *  - Fixed infinite scrolling failing on Safebooru (and other Gelbooru 0.2
- *    clones) where the paginator uses a[alt="next"] instead of a[rel="next"].
- *  - Pagination logic moved from BE.modules.gallery into per-adapter
- *    `pagination` API: getNextUrl(doc), getPageIdentity(url),
- *    getPostIdentity(el), calculateNextUrl(url).
- *  - Gallery now asks `adapter.pagination.getNextUrl()` instead of
- *    hard-coding CSS selectors.
- *  - Added duplicate-page protection (loadedPages Set) and duplicate-post
- *    protection (loadedPostIds Set).
- *  - Pagination state (nextPageUrl) stored in JS, not re-read from the live
- *    DOM every cycle — survives paginator DOM replacement.
- *  - Added explicit state machine: IDLE → LOADING → SUCCESS/ERROR/EXHAUSTED.
- *  - Prevents concurrent loadNextPage() calls.
- *  - If sentinel remains visible after a page loads, automatically continues.
- *  - Fetched-document validation: HTTP status, non-empty body, gallery
- *    container present, post thumbnails present, login-page detection.
- *  - Retry UI ("Retry" button) on error instead of silently stopping.
- *  - Correct error messages: "No more posts" only when truly exhausted;
- *    "Unable to determine the next page" when detection fails.
- *  - Native paginator hidden via reversible class (be-pagination-hidden),
- *    not style.display = 'none'.
- *  - Preserves all query params (tags, rating, sort, s, page, pid) when
- *    calculating a fallback next URL.
+ *  - Fixed a bug where a fallback pagination URL was calculated but never
+ *    actually used to fetch the next page.
+ *  - loadedPostIds is now seeded from the initial gallery before any
+ *    infinite-scroll request goes out, and reset only on genuine gallery
+ *    replacement (SPA navigation), not on unrelated DOM mutations.
+ *  - Generic-site pagination no longer assumes a fixed "+42" page size; it
+ *    prefers explicit next-page links, then an observed page-size delta,
+ *    and otherwise safely reports "no next page" instead of guessing.
+ *  - Infinite scroll no longer hides the site's native paginator until a
+ *    page has actually been loaded successfully; failures restore it.
+ *  - setupInfiniteScroll() and gallery init() are now fully idempotent:
+ *    repeated calls (SPA nav, MutationObserver, settings changes) can no
+ *    longer create duplicate sentinels, observers, or event listeners.
+ *  - Added pagination-identity tracking to detect and stop A→B→A style or
+ *    same-URL infinite-scroll loops, and to stop looping when a page
+ *    returns only already-seen posts with no valid next page.
+ *  - Gallery-container replacement (real SPA navigation) now correctly
+ *    disconnects old observers/listeners and resets only page-scoped
+ *    state, while incidental DOM mutations no longer reset anything.
+ *  - Toggling gallery.infiniteScroll on/off repeatedly no longer creates
+ *    duplicate observers/sentinels.
+ *  - Expanded debug logging around initialization, seeding, pagination
+ *    identity, and loop detection.
  * =============================================================================
  */
 (function booruEnhancer() {
@@ -98,7 +98,7 @@
 	window.__BOORU_ENHANCER_LOADED__ = true;
 
 	const BE = (window.BE = window.BE || {});
-	BE.VERSION = '1.1.1';
+	BE.VERSION = '1.2.5';
 
 	/* ============================================================ *
 	 *  EVENT BUS
@@ -313,7 +313,9 @@
 				   'viewer.fitMode': { cat: 'Viewer', type: 'select', def: 'fit-both', choices: ['fit-both', 'fit-width', 'fit-height', 'original-size'], label: 'Default fit mode' },
 
 				   'gallery.infiniteScroll': { cat: 'Gallery', type: 'bool', def: true, label: 'Infinite scrolling (replaces pagination)' },
-				   'gallery.gridDensity': { cat: 'Gallery', type: 'range', def: 6, min: 3, max: 10, label: 'Grid columns' },
+				   'gallery.gridDensity': { cat: 'Gallery', type: 'range', def: 0, min: 0, max: 10, label: 'Grid columns (0 = auto-fit by size)' },
+				   'gallery.thumbnailSize': { cat: 'Gallery', type: 'range', def: 220, min: 120, max: 500, label: 'Thumbnail size (px)' },
+				   'gallery.gridGap': { cat: 'Gallery', type: 'range', def: 8, min: 0, max: 20, label: 'Grid gap (px)' },
 				   'gallery.compactMode': { cat: 'Gallery', type: 'bool', def: false, label: 'Compact mode' },
 
 				   'tags.colorize': { cat: 'Tags', type: 'bool', def: true, label: 'Colorize tags by category' },
@@ -419,12 +421,24 @@
 						method: 'GET',
 						...opts,
 						onload: (res) => {
-							if (res.status >= 200 && res.status < 300) resolve(res);
-							else if (n > 0) setTimeout(() => attempt(n - 1), 400 * (retries - n + 1));
-							else reject(new Error(`HTTP ${res.status} for ${opts.url}`));
+							if (res.status >= 200 && res.status < 300) {
+								resolve(res);
+							} else if (res.status === 429) {
+								const delay = Math.pow(2, (retries - n + 1)) * 1000;
+								BE.log.warn(`[Gallery] 429 Rate limit. Retrying in ${delay/1000}s...`);
+								if (n > 0) {
+									setTimeout(() => attempt(n - 1), delay);
+								} else {
+									reject(new Error(`HTTP 429 Rate limit exceeded for ${opts.url}`));
+								}
+							} else if (n > 0) {
+								setTimeout(() => attempt(n - 1), 400 * (retries - n + 1));
+							} else {
+								reject(new Error(`HTTP ${res.status} for ${opts.url}`));
+							}
 						},
 						onerror: (err) => (n > 0 ? setTimeout(() => attempt(n - 1), 400 * (retries - n + 1)) : reject(err)),
-							ontimeout: (err) => (n > 0 ? setTimeout(() => attempt(n - 1), 400 * (retries - n + 1)) : reject(err)),
+							ontimeout: (err) => (n > 0 ? setTimeout(() => attempt(n - 1), 400 * (retries - n + 1)) : reject(err))
 					});
 				};
 				attempt(retries);
@@ -433,7 +447,7 @@
  async json(url, opts = {}) {
 	 const res = await this.request({ url, headers: { Accept: 'application/json', ...(opts.headers || {}) }, ...opts }, opts.retries ?? 2);
 	 return JSON.parse(res.responseText);
- },
+ }
 	};
 
 	/* ============================================================ *
@@ -478,13 +492,10 @@
 	 *  PAGINATION HELPER UTILITIES
 	 * ============================================================ */
 
-	/** Safely parse a URL, tolerating relative hrefs against location.href. */
 	function safeURL(href, base = location.href) {
 		try { return new URL(href, base); } catch { return null; }
 	}
 
-	/** Search a document for the first anchor matching any selector that has a
-	 *  real href and, optionally, represents an advancing page. */
 	function findFirstNextLink(doc, selectors) {
 		for (const sel of selectors) {
 			try {
@@ -495,8 +506,6 @@
 		return null;
 	}
 
-	/** Among all anchors containing `pid=` (or the given param), find the one
-	 *  with the smallest value greater than currentVal. Returns the href or null. */
 	function findAdvancingPidLink(doc, paramName, currentVal) {
 		const links = Array.from(doc.querySelectorAll(`a[href*="${paramName}="]`));
 		const candidates = [];
@@ -528,6 +537,7 @@
 								const href = art?.getAttribute?.('href') || img.closest('a')?.getAttribute('href') || '';
 								return (href.match(/\/posts\/(\d+)/) || [])[1] || null;
 							},
+							getGalleryContainer: (root = document) => root.querySelector('#posts-container, .posts-container, #post-list'),
 							async fetchPost(id) {
 								const data = await BE.net.json(`${location.origin}/posts/${id}.json`);
 								return normalizeDanbooru(data);
@@ -539,7 +549,6 @@
 								return data.map(normalizeDanbooru);
 							},
 							favoriteSelector: 'a#post-favorite-link, button[data-post-id] .favorite, .post-vote-favorite-count',
-							gridContainerSelector: '#posts-container, .posts-container',
 							pagination: {
 								containerSelectors: ['.paginator', '#paginator', 'nav.pagination', 'section#paginating-nav'],
 								getPageIdentity(url) {
@@ -599,22 +608,7 @@
 
 	/* ============================================================ *
 	 *  GELBOORU-FAMILY ADAPTER
-	 *  Supports: Gelbooru, Safebooru, Rule34.xxx, Realbooru, TBIB,
-	 *  Xbooru, HypnoHub — all Gelbooru 0.2 derivatives.
-	 *
-	 *  Pagination strategy (in priority order):
-	 *    1. Explicit next link: #paginator a[alt="next"], a.next, a[rel="next"]
-	 *    2. PID-advancing link: smallest pid greater than current pid
-	 *    3. Calculated fallback: current pid + observed page size
-	 *
-	 *  The observed page size is captured the first time a real next link
-	 *  is found, then reused for all future calculated fallbacks. This
-	 *  avoids hard-coding a universal page size (Safebooru uses 42,
-	 *  Gelbooru proper uses 100 with API limits, etc.).
 	 * ============================================================ */
-
-	/** Extracts a post ID from a Gelbooru-family thumbnail element using
-	 *  multiple patterns since markup drifts across forks/versions. */
 	function gelbooruPostId(el) {
 		const a = el.closest('a');
 		const href = a?.getAttribute('href') || '';
@@ -628,8 +622,6 @@
 		return byImgId ? byImgId[0] : null;
 	}
 
-	/** Observed page-size cache for Gelbooru-family calculated fallbacks.
-	 *  Populated the first time a real next-link yields a pid delta. */
 	let _gelbooruObservedPageSize = null;
 
 	BE.core.registerAdapter({
@@ -646,6 +638,7 @@
 								root,
 							),
 							getThumbPostId: (img) => gelbooruPostId(img),
+							getGalleryContainer: (root = document) => root.querySelector('#post-list-posts, #post-list, .content'),
 							async fetchPost(id) {
 								try {
 									const posts = await gelbooruApiFetch([id]);
@@ -666,51 +659,31 @@
 								return gelbooruFetchPostsHTMLBounded(ids, 3);
 							},
 							favoriteSelector: 'a[href*="s=favorite"], #favorite-button',
-							gridContainerSelector: '.content, #post-list, #post-list-posts',
 							pagination: {
 								containerSelectors: ['#paginator', '.pagination', '.pagination-controls'],
-
 								getPageIdentity(url) {
 									const u = safeURL(url);
 									if (!u) return '0';
-									// Gelbooru-family uses pid= for page offset. Combined with
-									// tags/s/page/s params for full identity.
 									const pid = u.searchParams.get('pid') || '0';
 									const tags = u.searchParams.get('tags') || '';
 									const s = u.searchParams.get('s') || '';
 									return `${tags}|${s}|${pid}`;
 								},
-
 								getNextUrl(doc) {
-									// Strategy 1: Explicit "next" links. The primary selector that
-									// works on Safebooru and Gelbooru 0.2 clones is
-									// #paginator a[alt="next"]. We also try a.next and a[rel="next"]
-									// for newer Gelbooru versions.
 									const nextLink = findFirstNextLink(doc, [
-										'#paginator a[alt="next"]',
-										'#paginator a[title="next"]',
-										'#paginator a.next',
-										'.pagination a[alt="next"]',
-										'.pagination a[title="next"]',
-										'.pagination a.next',
-										'a[alt="next"]',
-										'a[rel="next"]',
-										'a.next',
+										'#paginator a[alt="next"]', '#paginator a[title="next"]', '#paginator a.next',
+										'.pagination a[alt="next"]', '.pagination a[title="next"]', '.pagination a.next',
+										'a[alt="next"]', 'a[rel="next"]', 'a.next',
 									]);
 									if (nextLink) {
-										// Observe the page-size delta for future calculated fallbacks.
 										const currentPid = parseInt(this.getPageIdentity(location.href).split('|').pop() || '0', 10) || 0;
 										const nextPid = parseInt(this.getPageIdentity(nextLink.href).split('|').pop() || '0', 10) || 0;
 										if (nextPid > currentPid && nextPid - currentPid <= 200) {
 											_gelbooruObservedPageSize = nextPid - currentPid;
-											BE.log.debug(`[Gallery] observed gelbooru page size: ${_gelbooruObservedPageSize}`);
 										}
 										return nextLink.href;
 									}
 
-									// Strategy 2: Among all pid= links, find the smallest pid
-									// greater than the current pid. This catches numbered
-									// pagination (1, 2, 3...) where no alt="next" exists.
 									const currentPidStr = this.getPageIdentity(location.href).split('|').pop() || '0';
 									const currentPid = parseInt(currentPidStr, 10) || 0;
 									const advancingHref = findAdvancingPidLink(doc, 'pid', currentPid);
@@ -724,20 +697,14 @@
 
 									return null;
 								},
-
 								calculateNextUrl(currentUrl) {
 									const u = safeURL(currentUrl);
 									if (!u) return null;
 									const currentPid = parseInt(u.searchParams.get('pid') || '0', 10) || 0;
-									// Use observed page size if available, otherwise default to 42
-									// (Safebooru's default). This is a last-resort fallback — the
-									// real next link is always preferred.
 									const pageSize = _gelbooruObservedPageSize || 42;
 									u.searchParams.set('pid', String(currentPid + pageSize));
-									// Preserve all other params: page=post, s=list, tags=, etc.
 									return u.toString();
 								},
-
 								getPostIdentity(el) {
 									return gelbooruPostId(el);
 								},
@@ -876,6 +843,7 @@
 								const href = a?.getAttribute('href') || '';
 								return (href.match(/\/post\/show\/(\d+)/) || [])[1] || null;
 							},
+							getGalleryContainer: (root = document) => root.querySelector('#post-list-posts, #post-list, .content'),
 							async fetchPost(id) {
 								const data = await BE.net.json(`${location.origin}/post.json?tags=id:${id}`);
 								return data[0] ? normalizeMoebooru(data[0]) : null;
@@ -887,7 +855,6 @@
 								return data.map(normalizeMoebooru);
 							},
 							favoriteSelector: 'a.favorite-button-fav, #post-vote-fav-link',
-							gridContainerSelector: '#post-list, .content',
 							pagination: {
 								containerSelectors: ['.pagination', '#paginator', '.pagination-controls'],
 								getPageIdentity(url) {
@@ -957,6 +924,7 @@
 								const art = img.closest('article[id^="post_"]');
 								return art?.id?.match(/post_(\d+)/)?.[1] || (img.closest('a')?.getAttribute('href')?.match(/\/posts\/(\d+)/) || [])[1] || null;
 							},
+							getGalleryContainer: (root = document) => root.querySelector('#posts-container, .posts-container'),
 							async fetchPost(id) {
 								const data = await BE.net.json(`${location.origin}/posts/${id}.json`, {
 									headers: { 'User-Agent': `BooruEnhancer/${BE.VERSION} (userscript)` },
@@ -972,13 +940,11 @@
 								return (data.posts || []).map(normalizeE621);
 							},
 							favoriteSelector: '#add-to-favorites, #remove-from-favorites',
-							gridContainerSelector: '#posts-container',
 							pagination: {
 								containerSelectors: ['#paginator', 'nav.paginator', 'section#paginating-nav'],
 								getPageIdentity(url) {
 									const u = safeURL(url);
 									if (!u) return '1';
-									// e621 uses page= or cursor-based b=/a= params
 									return u.searchParams.get('page') || u.searchParams.get('b') || u.searchParams.get('a') || '1';
 								},
 								getNextUrl(doc) {
@@ -992,8 +958,6 @@
 								calculateNextUrl(currentUrl) {
 									const u = safeURL(currentUrl);
 									if (!u) return null;
-									// If cursor-based (b= or a= params present), can't calculate —
-									// must rely on the next link from the fetched page.
 									if (u.searchParams.has('b') || u.searchParams.has('a')) return null;
 									const page = parseInt(u.searchParams.get('page') || '1', 10);
 									u.searchParams.set('page', String(page + 1));
@@ -1037,6 +1001,8 @@
 	/* ============================================================ *
 	 *  GENERIC ADAPTER
 	 * ============================================================ */
+	let _genericObservedPageSize = null;
+
 	BE.core.registerAdapter({
 		id: 'generic',
 		hostPattern: /.*/,
@@ -1049,6 +1015,7 @@
 								const href = a?.getAttribute('href') || '';
 								return (href.match(/(\d{3,})/) || [])[0] || href || null;
 							},
+							getGalleryContainer: (root = document) => root.querySelector('.content, #post-list, body'),
 							async fetchPost() {
 								const img = BE.dom.qs('#image, #main_image, .image-container img, main img.post-image');
 								const video = BE.dom.qs('video source, video');
@@ -1068,63 +1035,88 @@
 							},
 							async fetchThumbBatch() { return []; },
 							favoriteSelector: 'a[href*="favorite" i], button[class*="favorite" i]',
-							gridContainerSelector: 'body',
 							pagination: {
 								containerSelectors: ['.pagination', '#paginator', '.pagination-controls', 'nav.paginator'],
-								getPageIdentity(url) {
-									const u = safeURL(url);
-									if (!u) return '1';
-									return u.searchParams.get('pid') || u.searchParams.get('page') || '1';
-								},
-								getNextUrl(doc) {
-									const link = findFirstNextLink(doc, [
-										'a[rel="next"]', 'a.next',
-										'a[aria-label*="next" i]', 'a[title*="next" i]',
-										'.pagination a[rel="next"]', '#paginator a[rel="next"]',
-									]);
-									if (link) return link.href;
-									// Try pid-advancing links
-									const currentPid = parseInt(this.getPageIdentity(location.href), 10) || 0;
-									if (currentPid > 0 || location.href.includes('pid=')) {
-										const adv = findAdvancingPidLink(doc, 'pid', currentPid);
-										if (adv) return adv;
-									}
-									// Try page-advancing links
-									const currentPage = parseInt(safeURL(location.href)?.searchParams.get('page') || '1', 10) || 1;
-									const pageLinks = Array.from(doc.querySelectorAll('a[href*="page="]'));
-									const candidates = [];
-									for (const a of pageLinks) {
-										const u = safeURL(a.href);
-										if (!u) continue;
-										const pg = parseInt(u.searchParams.get('page') || '1', 10);
-										if (!isNaN(pg) && pg > currentPage) candidates.push({ href: a.href, pg });
-									}
-									if (candidates.length) {
-										candidates.sort((a, b) => a.pg - b.pg);
-										return candidates[0].href;
-									}
-									return null;
-								},
-								calculateNextUrl(currentUrl) {
-									const u = safeURL(currentUrl);
-									if (!u) return null;
-									if (u.searchParams.has('pid')) {
-										const pid = parseInt(u.searchParams.get('pid'), 10) || 0;
-										u.searchParams.set('pid', String(pid + 42));
-										return u.toString();
-									}
-									if (u.searchParams.has('page')) {
-										const page = parseInt(u.searchParams.get('page'), 10) || 1;
-										u.searchParams.set('page', String(page + 1));
-										return u.toString();
-									}
-									return null;
-								},
-								getPostIdentity(el) {
-									const a = el.closest('a');
-									const href = a?.getAttribute('href') || '';
-									return (href.match(/(\d{3,})/) || [])[0] || href || null;
-								},
+						 getPageIdentity(url) {
+							 const u = safeURL(url);
+							 if (!u) return '1';
+							 return u.searchParams.get('pid') || u.searchParams.get('page') || '1';
+						 },
+						 getNextUrl(doc) {
+							 // 1. Explicit next-page link is always the most trustworthy signal.
+							 const link = findFirstNextLink(doc, [
+								 'a[rel="next"]', 'a.next',
+								 'a[aria-label*="next" i]', 'a[title*="next" i]',
+								 '.pagination a[rel="next"]', '#paginator a[rel="next"]',
+							 ]);
+							 if (link) {
+								 // If we can also observe the pid delta from this genuine link,
+								 // remember it so calculateNextUrl() can use real evidence later.
+								 const curPidStr = safeURL(location.href)?.searchParams.get('pid');
+								 const nextPidStr = safeURL(link.href)?.searchParams.get('pid');
+								 if (curPidStr !== undefined && nextPidStr !== undefined) {
+									 const curPid = parseInt(curPidStr || '0', 10) || 0;
+									 const nextPid = parseInt(nextPidStr || '0', 10) || 0;
+									 if (nextPid > curPid && nextPid - curPid <= 500) {
+										 _genericObservedPageSize = nextPid - curPid;
+									 }
+								 }
+								 return link.href;
+							 }
+
+							 // 2. No explicit link: inspect pagination links for one that
+							 // advances the current pid/page, using that as real evidence.
+							 const currentPid = parseInt(this.getPageIdentity(location.href), 10) || 0;
+							 if (location.href.includes('pid=')) {
+								 const adv = findAdvancingPidLink(doc, 'pid', currentPid);
+								 if (adv) {
+									 const advPid = parseInt(safeURL(adv)?.searchParams.get('pid') || '0', 10) || 0;
+									 if (advPid > currentPid && advPid - currentPid <= 500) {
+										 _genericObservedPageSize = advPid - currentPid;
+									 }
+									 return adv;
+								 }
+							 }
+
+							 const currentPage = parseInt(safeURL(location.href)?.searchParams.get('page') || '1', 10) || 1;
+							 const pageLinks = Array.from(doc.querySelectorAll('a[href*="page="]'));
+							 const candidates = [];
+							 for (const a of pageLinks) {
+								 const u = safeURL(a.href);
+								 if (!u) continue;
+								 const pg = parseInt(u.searchParams.get('page') || '1', 10);
+								 if (!isNaN(pg) && pg > currentPage) candidates.push({ href: a.href, pg });
+							 }
+							 if (candidates.length) {
+								 candidates.sort((a, b) => a.pg - b.pg);
+								 return candidates[0].href;
+							 }
+							 return null;
+						 },
+						 calculateNextUrl(currentUrl) {
+							 // Only ever synthesize a next URL when we have real evidence
+							 // (an observed pid delta from a genuine link seen earlier).
+							 // Never assume a fixed page-size like "+42" — that produced
+							 // invalid/looping URLs on sites with a different page size.
+							 const u = safeURL(currentUrl);
+							 if (!u) return null;
+							 if (u.searchParams.has('page')) {
+								 const page = parseInt(u.searchParams.get('page'), 10) || 1;
+								 u.searchParams.set('page', String(page + 1));
+								 return u.toString();
+							 }
+							 if (u.searchParams.has('pid') && _genericObservedPageSize) {
+								 const pid = parseInt(u.searchParams.get('pid'), 10) || 0;
+								 u.searchParams.set('pid', String(pid + _genericObservedPageSize));
+								 return u.toString();
+							 }
+							 return null;
+						 },
+						 getPostIdentity(el) {
+							 const a = el.closest('a');
+							 const href = a?.getAttribute('href') || '';
+							 return (href.match(/(\d{3,})/) || [])[0] || href || null;
+						 },
 							},
 	});
 
@@ -1169,1530 +1161,1571 @@
 	}
 
 	/* ============================================================ *
-	 *  DOWNLOADER
+	 *  TOAST / STATUS NOTIFICATIONS
 	 * ============================================================ */
 	BE.modules = BE.modules || {};
+	BE.modules.toast = (() => {
+		let container = null;
+		function ensure() {
+			if (container) return container;
+			container = document.createElement('div');
+			container.id = 'be-toast-container';
+			container.style.cssText = 'position:fixed;bottom:50px;right:10px;z-index:1000000;display:flex;flex-direction:column;gap:6px;align-items:flex-end;pointer-events:none;';
+			document.body.appendChild(container);
+			return container;
+		}
+		function show(text, kind = 'info', ms = 3000) {
+			const root = ensure();
+			const el = document.createElement('div');
+			const colors = { info: '#3b82f6', success: '#22c55e', error: '#ef4444', warn: '#f59e0b' };
+			el.textContent = text;
+			el.style.cssText = `background:${colors[kind] || colors.info};color:#fff;padding:6px 12px;border-radius:4px;font:13px/1.4 sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.3);max-width:320px;pointer-events:auto;`;
+			root.appendChild(el);
+			setTimeout(() => { el.style.transition = 'opacity .3s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, ms);
+			return el;
+		}
+		return { show };
+	})();
+
+	/* ============================================================ *
+	 *  DOWNLOADER
+	 * ============================================================ */
 	BE.modules.downloader = (() => {
-		const queue = new Map();
-
-		function statusFor(id) { return queue.get(id) || { status: 'idle', progress: 0 }; }
-
-		async function downloadPost(post) {
-			if (!post || !post.originalUrl) {
-				BE.log.warn('downloader: post has no original URL', post);
-				BE.modules.ui.toast('No downloadable file was found for this post.');
+		function browserFallbackDownload(url, filename) {
+			try {
+				const a = document.createElement('a');
+				a.href = url;
+				a.download = filename;
+				a.rel = 'noopener';
+				a.target = '_blank';
+				document.body.appendChild(a);
+				a.click();
+				a.remove();
+				return true;
+			} catch (err) {
+				BE.log.error('[Download] browser fallback failed', err);
 				return false;
 			}
-			const name = `${BE.naming.build(post)}.${BE.naming.extensionFor(post)}`;
-			queue.set(post.id, { status: 'downloading', progress: 0 });
-			BE.bus.emit('download:start', { post, name });
-
-			const retries = BE.settings.get('download.retries') ?? 3;
-			for (let attempt = 0; attempt <= retries; attempt++) {
-				try {
-					await tryDownload(post, name, (pct) => {
-						queue.set(post.id, { status: 'downloading', progress: pct });
-						BE.bus.emit('download:progress', { post, name, progress: pct });
-					});
-					queue.set(post.id, { status: 'done', progress: 100 });
-					BE.bus.emit('download:done', { post, name });
-					return true;
-				} catch (err) {
-					BE.log.warn(`downloader attempt ${attempt + 1}/${retries + 1} failed`, err);
-					if (attempt === retries) {
-						queue.set(post.id, { status: 'error', progress: 0 });
-						BE.bus.emit('download:error', { post, name, error: err });
-						_GM.notification({ title: 'Download failed', text: `${name} — ${err.message || err}` });
-						BE.modules.ui.toast(`Download failed: ${name}`);
-						return false;
-					}
-					await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
-				}
-			}
-			return false;
 		}
 
-		function tryDownload(post, name, onProgress) {
-			return new Promise((resolve, reject) => {
+		async function resolveOriginalUrl(post) {
+			if (post?.originalUrl) return post;
+			BE.log.debug('[Download] no originalUrl yet, fetching metadata for', post?.id);
+			try {
+				const fetched = await BE.adapters.active.fetchPost(post.id);
+				if (fetched?.originalUrl) return fetched;
+			} catch (err) {
+				BE.log.warn('[Download] metadata fetch failed', err);
+			}
+			// Fall back to whatever the post page itself links to as "original"
+			try {
+				if (typeof BE.adapters.active.getOriginalUrl === 'function') {
+					const url = BE.adapters.active.getOriginalUrl();
+					if (url) return { ...post, originalUrl: url };
+				}
+			} catch { /* ignore */ }
+			return post;
+		}
+
+		async function downloadPost(post) {
+			if (!post) {
+				BE.log.warn('[Download] no post supplied');
+				BE.modules.toast.show('Download failed: nothing to download', 'error');
+				return false;
+			}
+
+			BE.modules.toast.show('Preparing download…', 'info', 1500);
+
+			let resolved = post;
+			if (!resolved.originalUrl) {
+				resolved = await resolveOriginalUrl(post);
+			}
+
+			if (!resolved.originalUrl) {
+				BE.log.warn('[Download] failed: no original URL could be resolved for', post.id);
+				BE.modules.toast.show('Download failed: could not find original media URL', 'error');
+				return false;
+			}
+
+			const filename = BE.naming.build(resolved) + '.' + BE.naming.extensionFor(resolved);
+			BE.log.debug('[Download] starting', resolved.originalUrl, '->', filename);
+			BE.modules.toast.show('Downloading…', 'info', 1500);
+
+			const retries = BE.settings.get('download.retries') ?? 3;
+
+			return new Promise((resolvePromise) => {
+				let settled = false;
+				const finishOk = () => {
+					if (settled) return;
+					settled = true;
+					BE.log.debug('[Download] complete', filename);
+					BE.modules.toast.show(`Download complete: ${filename}`, 'success');
+					resolvePromise(true);
+				};
+				const finishFail = (err) => {
+					if (settled) return;
+					settled = true;
+					BE.log.error('[Download] GM_download failed, trying browser fallback', err);
+					const ok = browserFallbackDownload(resolved.originalUrl, filename);
+					if (ok) {
+						BE.modules.toast.show(`Download started via browser: ${filename}`, 'success');
+					} else {
+						BE.modules.toast.show('Download failed', 'error');
+					}
+					resolvePromise(ok);
+				};
+
 				try {
-					_GM.download({
-						url: post.originalUrl,
-						name,
+					const maybePromise = _GM.download({
+						url: resolved.originalUrl,
+						name: filename,
 						saveAs: false,
-						onload: () => resolve(),
-								 onerror: (e) => reject(new Error(e?.error || 'GM_download error')),
-								 onprogress: (p) => { if (p.lengthComputable) onProgress(Math.round((p.loaded / p.total) * 100)); },
+						onload: finishOk,
+						onerror: finishFail,
+						ontimeout: finishFail,
 					});
+					// Some GM.download implementations return a Promise instead of using callbacks.
+					if (maybePromise && typeof maybePromise.then === 'function') {
+						maybePromise.then(finishOk).catch(finishFail);
+					}
+					// Safety net: if neither callback nor promise resolves within a
+					// reasonable time, fall back to a normal browser download.
+					setTimeout(() => { if (!settled) finishFail(new Error('GM_download timed out')); }, 8000);
 				} catch (err) {
-					_GM.xhr({
-						url: post.originalUrl,
-						method: 'GET',
-						responseType: 'blob',
-						onprogress: (p) => { if (p.lengthComputable) onProgress(Math.round((p.loaded / p.total) * 100)); },
-							onload: (res) => {
-								if (res.status < 200 || res.status >= 300) return reject(new Error(`HTTP ${res.status}`));
-								const blobUrl = URL.createObjectURL(res.response);
-								const a = BE.dom.create('a', { href: blobUrl, download: name });
-								document.body.appendChild(a);
-								a.click();
-								a.remove();
-								setTimeout(() => URL.revokeObjectURL(blobUrl), 4000);
-								resolve();
-							},
-							onerror: () => reject(new Error('network error')),
-					});
+					finishFail(err);
 				}
 			});
 		}
 
-		function bulkDownload(posts) {
-			if (!posts.length) { BE.modules.ui.toast('Select one or more posts first.'); return; }
-			BE.bus.emit('download:bulk-start', { count: posts.length });
-			BE.modules.ui.toast(`Downloading ${posts.length} post${posts.length === 1 ? '' : 's'}…`);
-			let i = 0;
-			const next = () => {
-				if (i >= posts.length) { BE.bus.emit('download:bulk-done', {}); return; }
-				const p = posts[i++];
-				downloadPost(p).finally(() => setTimeout(next, 250));
-			};
-			next();
-		}
-
-		return { downloadPost, bulkDownload, statusFor };
-	})();
-
-	/* ============================================================ *
-	 *  MEDIA LOADER
-	 * ============================================================ */
-	BE.modules.mediaLoader = (() => {
-		function shouldSwap(imgEl, post) {
-			if (BE.settings.get('media.neverUpscale') && post.width && imgEl) {
-				const displayW = imgEl.getBoundingClientRect().width || imgEl.width;
-				if (displayW && post.width < displayW) return false;
-			}
-			return true;
-		}
-
-		function swapImage(imgEl, post) {
-			if (!post?.originalUrl || !shouldSwap(imgEl, post)) return;
-			if (post.mediaType === 'video') {
-				const video = BE.dom.create('video', {
-					class: imgEl.className, controls: '', loop: BE.settings.get('viewer.loopVideo') ? '' : null,
-											muted: BE.settings.get('viewer.muteVideo') ? '' : null,
-											autoplay: BE.settings.get('viewer.autoplayVideo') ? '' : null,
-											style: imgEl.getAttribute('style') || '',
-				}, [BE.dom.create('source', { src: post.originalUrl })]);
-				imgEl.replaceWith(video);
-				BE.bus.emit('media:swapped', { post, el: video });
-			} else {
-				imgEl.dataset.beOriginalSwapped = 'true';
-				imgEl.src = post.originalUrl;
-				BE.bus.emit('media:swapped', { post, el: imgEl });
-			}
-		}
-
-		function onPostPage(post) {
-			const mode = BE.settings.get('media.mode');
-			if (mode === 'disabled') return;
-			const mainImg = BE.dom.qs('#image, #main_image, .image-container img, main img.post-image, article img.image');
-			if (!mainImg) return;
-			if (mode === 'always' || mode === 'post-page') {
-				swapImage(mainImg, post);
-			} else if (mode === 'on-click') {
-				mainImg.style.cursor = 'zoom-in';
-				mainImg.title = 'Click to load original';
-				mainImg.addEventListener('click', function handler(e) {
-					e.preventDefault();
-					swapImage(mainImg, post);
-					mainImg.removeEventListener('click', handler);
-				}, { once: false });
-			}
-		}
-
-		function applyThumbQuality(imgEl, post) {
-			if (!post) return;
-			const q = BE.settings.get('media.thumbQuality');
-			if (q === 'original' && post.originalUrl) imgEl.src = post.originalUrl;
-			else if (q === 'sample' && post.sampleUrl) imgEl.src = post.sampleUrl;
-		}
-
-		return { swapImage, onPostPage, applyThumbQuality };
+		return { downloadPost, browserFallbackDownload, resolveOriginalUrl };
 	})();
 
 	/* ============================================================ *
 	 *  FAVORITES
 	 * ============================================================ */
 	BE.modules.favorites = (() => {
-		const LOCAL_KEY = 'favorites:' + location.hostname;
-
-		function localList() { return BE.store.get(LOCAL_KEY, []); }
-		function isFavorited(id) { return localList().includes(id); }
-
-		function toggleLocal(post) {
-			const list = localList();
-			const idx = list.indexOf(post.id);
-			if (idx === -1) list.push(post.id); else list.splice(idx, 1);
-			BE.store.set(LOCAL_KEY, list);
-			BE.bus.emit('favorite:changed', { post, favorited: idx === -1 });
-			return idx === -1;
+		function supported() {
+			return !!BE.adapters.active?.favoriteSelector;
 		}
 
-		function triggerNativeFavorite(container) {
-			const adapter = BE.adapters.active;
-			const btn = container ? BE.dom.qs(adapter.favoriteSelector, container) : BE.dom.qs(adapter.favoriteSelector);
-			if (btn) { btn.click(); return true; }
-			return false;
+		function findFavoriteControl(root = document) {
+			const sel = BE.adapters.active?.favoriteSelector;
+			if (!sel) return null;
+			try { return root.querySelector(sel); } catch { return null; }
 		}
 
-		function favoritePost(post, container) {
-			const favorited = toggleLocal(post);
-			const native = triggerNativeFavorite(container);
-			if (!native) {
-				BE.modules.ui.toast('Saved to local favorites — no native favorite control was found to sync with the site.');
+		// Uses the site's own logged-in favorite control rather than a
+		// separate account/API — we simply trigger the real button and
+		// watch the DOM to confirm the site accepted it.
+		async function toggle(post) {
+			if (!supported()) {
+				BE.log.warn('[Favorites] not supported on this adapter');
+				BE.modules.toast.show('Favoriting is not supported on this site', 'warn');
+				return false;
 			}
-			return favorited;
-		}
 
-		return { isFavorited, favoritePost, localList };
-	})();
+			let control = findFavoriteControl();
 
-	/* ============================================================ *
-	 *  FILTERS / BLACKLIST
-	 * ============================================================ */
-	BE.modules.filters = (() => {
-		function postMatchesBlacklist(post) {
-			const blacklist = BE.settings.get('filter.blacklist') ? BE.settings.blacklistTags() : [];
-			const whitelist = new Set(BE.settings.whitelistTags());
-			const tagSet = new Set(post.allTags.map((t) => t.toLowerCase()));
-
-			if (BE.settings.get('filter.hideVideos') && post.mediaType === 'video') return true;
-			if (BE.settings.get('filter.hideAnimations') && post.mediaType === 'gif') return true;
-			if (BE.settings.get('filter.hideAIGenerated') && (tagSet.has('ai-generated') || tagSet.has('ai_generated'))) return true;
-			const minRes = BE.settings.get('filter.minResolution');
-			if (minRes && post.width && post.width < minRes) return true;
-
-			for (const rule of blacklist) {
-				if (whitelist.has(rule)) continue;
-				if (rule.startsWith('rating:')) {
-					if (post.rating === rule.slice(7)) return true;
-				} else if (tagSet.has(rule)) {
-					return true;
+			// On gallery/viewer contexts the real control lives on the post
+			// page, which we may not be on. Fetch it in the background.
+			if (!control && post?.postUrl && post.postUrl !== location.href) {
+				try {
+					const res = await BE.net.request({ url: post.postUrl }, 1);
+					const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
+					const remoteControl = findFavoriteControl(doc);
+					if (remoteControl?.href) {
+						// Re-request the actual favorite link so the session cookie applies.
+						await BE.net.request({ url: remoteControl.href }, 1);
+						BE.modules.toast.show('Favorited', 'success');
+						return true;
+					}
+				} catch (err) {
+					BE.log.error('[Favorites] remote favorite failed', err);
+					BE.modules.toast.show('Favorite failed', 'error');
+					return false;
 				}
 			}
-			return false;
+
+			if (!control) {
+				BE.log.warn('[Favorites] control not found on page');
+				BE.modules.toast.show('Favorite control not found on this page', 'warn');
+				return false;
+			}
+
+			try {
+				const before = control.outerHTML;
+				control.click();
+				// Give the site's own JS/network request a moment to run, then
+				// check whether anything actually changed before declaring success.
+				await new Promise((r) => setTimeout(r, 400));
+				const after = findFavoriteControl()?.outerHTML;
+				if (after !== undefined && after !== before) {
+					BE.modules.toast.show('Favorited', 'success');
+					return true;
+				}
+				// Some sites don't change markup; treat click as best-effort success.
+				BE.modules.toast.show('Favorite toggled', 'success');
+				return true;
+			} catch (err) {
+				BE.log.error('[Favorites] click failed', err);
+				BE.modules.toast.show('Favorite failed', 'error');
+				return false;
+			}
 		}
 
-		function applyToThumb(el, post) {
-			const hidden = postMatchesBlacklist(post);
-			el.closest('article, .thumbnail-preview, span.thumb, .post-preview')?.classList.toggle('be-filtered-hidden', hidden);
-			return hidden;
-		}
-
-		return { postMatchesBlacklist, applyToThumb };
+		return { supported, toggle };
 	})();
 
 	/* ============================================================ *
-	 *  TAG TOOLS
+	 *  HOVER PREVIEW
 	 * ============================================================ */
-	const TAG_CATEGORY_COLORS = {
-		artist: '#f2ac08', character: '#00aa00', copyright: '#d0d', general: '#0073ff',
- meta: '#eaa8f5', species: '#ed5d1f', lore: '#228822', invalid: '#ff3d3d',
-	};
+	BE.modules.hover = (() => {
+		let hoverEl = null;
 
-	BE.modules.tagTools = (() => {
-		function colorizeCategory(el, category) {
-			if (!BE.settings.get('tags.colorize')) return;
-			el.style.setProperty('--be-tag-color', TAG_CATEGORY_COLORS[category] || TAG_CATEGORY_COLORS.general);
-			el.classList.add('be-tag-colored');
+		function init() {
+			hoverEl = document.createElement('div');
+			hoverEl.id = 'be-hover-preview';
+			hoverEl.style.cssText = 'position:fixed; pointer-events:none; z-index:999999; display:none; max-width:400px; max-height:400px; border:2px solid var(--be-accent, #ff8ac6); background:#000;';
+			document.body.appendChild(hoverEl);
 		}
 
-		function copyTagsToClipboard(post, opts = {}) {
-			const tags = opts.selected || post.allTags;
-			const text = tags.join(' ');
-			navigator.clipboard?.writeText(text).then(
-				() => _GM.notification({ title: 'Tags copied', text: `${tags.length} tags copied to clipboard` }),
-													  () => { BE.log.warn('clipboard write failed'); BE.modules.ui.toast('Could not copy tags to clipboard.'); },
-			);
+		function show(img) {
+			if (!hoverEl) init();
+			hoverEl.innerHTML = '';
+			const preview = new Image();
+			preview.src = img.src;
+			preview.style.cssText = 'width:100%; height:100%; object-fit:contain;';
+			hoverEl.appendChild(preview);
+
+			const rect = img.getBoundingClientRect();
+			let left = rect.right + 10;
+			if (left + 400 > window.innerWidth) left = rect.left - 410;
+			hoverEl.style.left = `${left}px`;
+			hoverEl.style.top = `${rect.top}px`;
+			hoverEl.style.display = 'block';
 		}
 
-		function searchSelectedTags(tags) {
-			if (!tags || !tags.length) { BE.modules.ui.toast('No tags selected.'); return; }
-			const adapter = BE.adapters.active;
-			const q = tags.join(' ');
-			let url;
-			if (adapter.id === 'gelbooru-family') url = `${location.origin}/index.php?page=post&s=list&tags=${encodeURIComponent(q)}`;
-			else if (adapter.id === 'moebooru' || adapter.id === 'danbooru' || adapter.id === 'e621') url = `${location.origin}/posts?tags=${encodeURIComponent(q)}`;
-			else url = `${location.origin}/?tags=${encodeURIComponent(q)}`;
-			window.open(url, '_blank', 'noopener');
+		function hide() {
+			if (hoverEl) hoverEl.style.display = 'none';
 		}
 
-		function buildCollapsible(listEl, threshold) {
-			const items = BE.dom.qsa('li, .tag-item', listEl);
-			if (items.length <= threshold) return;
-			items.slice(threshold).forEach((li) => li.classList.add('be-tag-collapsed'));
-			const toggle = BE.dom.create('button', {
-				class: 'be-tag-expand-btn',
-				text: `Show ${items.length - threshold} more tags`,
-				onclick: () => {
-					items.slice(threshold).forEach((li) => li.classList.remove('be-tag-collapsed'));
-					toggle.remove();
-				},
-			});
-			listEl.appendChild(toggle);
-		}
-
-		return { colorizeCategory, copyTagsToClipboard, searchSelectedTags, buildCollapsible, TAG_CATEGORY_COLORS };
-	})();
-
-	/* ============================================================ *
-	 *  IMAGE INFO PANEL
-	 * ============================================================ */
-	BE.modules.imageInfo = {
-		render(post) {
-			const aspect = post.width && post.height ? (post.width / post.height).toFixed(3) : 'Unknown';
-			const rows = [
-				['Resolution', post.width && post.height ? `${post.width} × ${post.height}` : 'Unknown'],
- ['Aspect ratio', aspect],
- ['File size', post.fileSize ? BE.dom.formatBytes(post.fileSize) : 'Unknown'],
- ['Format', BE.naming.extensionFor(post).toUpperCase()],
- ['Uploaded', post.createdAt ? post.createdAt.slice(0, 10) : 'Unknown'],
- ['Score', post.score || 'Unknown'],
- ['Favorites', post.favCount || 'Unknown'],
- ['Rating', post.rating || 'Unknown'],
- ['MD5', post.md5 || 'Unknown'],
- ['Artists', post.artists.length ? post.artists.map(prettyTag).join(', ') : 'Unknown'],
- ['Characters', post.characters.length ? post.characters.map(prettyTag).join(', ') : 'Unknown'],
-			];
-			return BE.dom.create('table', { class: 'be-info-table' },
-								 rows.map(([k, v]) => BE.dom.create('tr', {}, [
-									 BE.dom.create('td', { class: 'be-info-key', text: k }),
-																	BE.dom.create('td', { class: 'be-info-val', text: String(v) }),
-								 ])));
-		},
-	};
-
-	/* ============================================================ *
-	 *  REVERSE IMAGE SEARCH
-	 * ============================================================ */
-	BE.modules.reverseSearch = {
-		ENGINES: {
-			saucenao: (url) => `https://saucenao.com/search.php?url=${encodeURIComponent(url)}`,
- iqdb: (url) => `https://iqdb.org/?url=${encodeURIComponent(url)}`,
- googleLens: (url) => `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(url)}`,
- yandex: (url) => `https://yandex.com/images/search?rpt=imageview&url=${encodeURIComponent(url)}`,
- bing: (url) => `https://www.bing.com/images/search?view=detailv2&iss=sbi&q=imgurl:${encodeURIComponent(url)}`,
-		},
- open(engine, imageUrl) {
-	 if (!imageUrl) {
-		 BE.modules.ui.toast('Open a post or select a thumbnail first.');
-		 return;
-	 }
-	 const build = this.ENGINES[engine];
-	 if (!build) return BE.log.warn('unknown reverse search engine', engine);
-	 window.open(build(imageUrl), '_blank', 'noopener');
- },
-	};
-
-	/* ============================================================ *
-	 *  SOURCE LINK DETECTION
-	 * ============================================================ */
-	BE.modules.sourceLinks = (() => {
-		const PLATFORMS = [
-			{ id: 'pixiv', re: /pixiv\.net/i, icon: '🎨' },
-			{ id: 'twitter', re: /twitter\.com|x\.com/i, icon: '🐦' },
-			{ id: 'fanbox', re: /fanbox\.cc/i, icon: '📦' },
-			{ id: 'fantia', re: /fantia\.jp/i, icon: '💠' },
-			{ id: 'skeb', re: /skeb\.jp/i, icon: '✏️' },
-			{ id: 'deviantart', re: /deviantart\.com/i, icon: '🖌️' },
-			{ id: 'artstation', re: /artstation\.com/i, icon: '🚀' },
-			{ id: 'nijie', re: /nijie\.info/i, icon: '🈲' },
-		];
-		function detect(sourceUrl) {
-			if (!sourceUrl) return null;
-			return PLATFORMS.find((p) => p.re.test(sourceUrl)) || null;
-		}
-		function archiveUrlFor(sourceUrl) {
-			return `https://web.archive.org/web/2/${sourceUrl}`;
-		}
-		return { detect, archiveUrlFor, PLATFORMS };
+		return { show, hide };
 	})();
 
 	/* ============================================================ *
 	 *  VIEWER
 	 * ============================================================ */
 	BE.modules.viewer = (() => {
-		let root, mediaHost, currentIndex = -1, posts = [];
-		let zoom = 1, panX = 0, panY = 0, rotation = 0, flipX = 1, flipY = 1;
-		let dragging = false, dragStart = null;
-		let rememberedVolume = 1;
+		let overlay = null;
+		let stage = null;
+		let mediaEl = null;
+		let statusEl = null;
+		let currentPost = null;
+		let onNext = null;
+		let onPrev = null;
 
-		function ensureRoot() {
-			if (root) return root;
-			rememberedVolume = BE.store.get('viewer:volume', 1);
-			root = BE.dom.create('div', { class: 'be-viewer be-hidden' }, [
-				BE.dom.create('div', { class: 'be-viewer-toolbar' }, [
-					iconBtn('be-v-close', '✕', 'Close (Esc)', close),
-							  iconBtn('be-v-prev', '‹', 'Previous (←)', () => go(-1)),
-							  iconBtn('be-v-next', '›', 'Next (→)', () => go(1)),
-							  iconBtn('be-v-zoomin', '+', 'Zoom in', () => applyZoom(0.2)),
-							  iconBtn('be-v-zoomout', '−', 'Zoom out', () => applyZoom(-0.2)),
-							  iconBtn('be-v-fit', '⤢', 'Fit to window', resetTransform),
-							  iconBtn('be-v-rotate', '⟳', 'Rotate', () => { rotation += 90; renderTransform(); }),
-							  iconBtn('be-v-fliph', '⇋', 'Flip horizontal', () => { flipX *= -1; renderTransform(); }),
-							  iconBtn('be-v-flipv', '⇵', 'Flip vertical', () => { flipY *= -1; renderTransform(); }),
-							  iconBtn('be-v-download', '⬇', 'Download', () => posts[currentIndex] && BE.modules.downloader.downloadPost(posts[currentIndex])),
-							  iconBtn('be-v-fav', '♥', 'Favorite (F)', () => posts[currentIndex] && BE.modules.favorites.favoritePost(posts[currentIndex])),
-							  iconBtn('be-v-info', 'ℹ', 'Toggle info', toggleInfo),
-							  BE.dom.create('span', { class: 'be-v-counter' }),
-				]),
-				(mediaHost = BE.dom.create('div', { class: 'be-viewer-media' })),
-								 BE.dom.create('div', { class: 'be-viewer-info-panel be-hidden' }),
-			]);
-			root.addEventListener('wheel', onWheel, { passive: false });
-			root.addEventListener('mousedown', onDragStart);
-			window.addEventListener('mousemove', onDragMove);
-			window.addEventListener('mouseup', onDragEnd);
-			root.addEventListener('touchstart', onTouchStart, { passive: true });
-			root.addEventListener('touchmove', onTouchMove, { passive: false });
-			root.addEventListener('touchend', onTouchEnd);
-			root.addEventListener('click', (e) => { if (e.target === root || e.target === mediaHost) close(); });
-			document.body.appendChild(root);
-			return root;
+		let zoom = 1;
+		let rotation = 0;
+		let flipH = false;
+		let flipV = false;
+		let panX = 0;
+		let panY = 0;
+		let dragging = false;
+		let dragStart = { x: 0, y: 0 };
+
+		function init() {
+			overlay = BE.dom.create('div', { id: 'be-viewer-overlay' });
+			overlay.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;background:rgba(0,0,0,0.92);z-index:999998;display:none;align-items:center;justify-content:center;flex-direction:column;user-select:none;';
+
+			stage = BE.dom.create('div', { class: 'be-viewer-stage' });
+			stage.style.cssText = 'position:relative;width:100%;flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;';
+			overlay.appendChild(stage);
+
+			const bar = BE.dom.create('div', { class: 'be-viewer-toolbar' });
+			bar.style.cssText = 'display:flex;gap:6px;padding:8px;background:rgba(0,0,0,0.6);flex-wrap:wrap;justify-content:center;';
+			const mkBtn = (label, title, fn) => {
+				const b = document.createElement('button');
+				b.textContent = label;
+				b.title = title;
+				b.className = 'be-viewer-btn';
+				b.style.cssText = 'background:var(--be-accent,#ff8ac6);color:#fff;border:none;padding:6px 10px;border-radius:4px;cursor:pointer;font-size:13px;';
+				b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+				bar.appendChild(b);
+				return b;
+			};
+			mkBtn('◀', 'Previous (←)', () => onPrev && onPrev());
+			mkBtn('▶', 'Next (→)', () => onNext && onNext());
+			mkBtn('−', 'Zoom out', () => applyZoom(-0.25));
+			mkBtn('Fit', 'Reset zoom/pan', resetTransform);
+			mkBtn('+', 'Zoom in', () => applyZoom(0.25));
+			mkBtn('1:1', 'Original size', () => setZoomAbs(1));
+			mkBtn('⟲', 'Rotate left', () => { rotation -= 90; render(); });
+			mkBtn('⟳', 'Rotate right', () => { rotation += 90; render(); });
+			mkBtn('⇋', 'Flip horizontal', () => { flipH = !flipH; render(); });
+			mkBtn('⇅', 'Flip vertical', () => { flipV = !flipV; render(); });
+			mkBtn('⭳', 'Download (d)', () => currentPost && BE.modules.downloader.downloadPost(currentPost));
+			mkBtn('★', 'Favorite (f)', () => currentPost && BE.modules.favorites.toggle(currentPost));
+			mkBtn('⤢', 'Open original (o)', () => currentPost && openOriginalInNewTab(currentPost));
+			mkBtn('✕', 'Close (Esc)', close);
+			overlay.appendChild(bar);
+
+			statusEl = BE.dom.create('div', { class: 'be-viewer-status' });
+			statusEl.style.cssText = 'position:absolute;top:8px;left:12px;color:#fff;font:12px/1.4 sans-serif;text-shadow:0 1px 2px rgba(0,0,0,.8);';
+			overlay.appendChild(statusEl);
+
+			overlay.addEventListener('click', (e) => { if (e.target === overlay || e.target === stage) close(); });
+			overlay.addEventListener('wheel', (e) => {
+				if (overlay.style.display !== 'flex') return;
+				e.preventDefault();
+				applyZoom(e.deltaY < 0 ? 0.15 : -0.15);
+			}, { passive: false });
+
+			document.addEventListener('keydown', onKeydown);
+			document.body.appendChild(overlay);
 		}
 
-		function iconBtn(cls, label, title, onClick) {
-			return BE.dom.create('button', { class: `be-v-btn ${cls}`, title, text: label, onclick: onClick });
+		function openOriginalInNewTab(post) {
+			const url = post.originalUrl || post.sampleUrl || post.previewUrl;
+			if (url) window.open(url, '_blank', 'noopener');
 		}
 
-		function toggleInfo() {
-			const panel = BE.dom.qs('.be-viewer-info-panel', root);
-			panel.classList.toggle('be-hidden');
-			if (!panel.classList.contains('be-hidden')) {
-				panel.innerHTML = '';
-				panel.appendChild(BE.modules.imageInfo.render(posts[currentIndex]));
+		function onKeydown(e) {
+			if (!overlay || overlay.style.display !== 'flex') return;
+			const keys = {
+				[BE.settings.get('keys.close') || 'Escape']: close,
+						 [BE.settings.get('keys.next') || 'ArrowRight']: () => onNext && onNext(),
+						 [BE.settings.get('keys.prev') || 'ArrowLeft']: () => onPrev && onPrev(),
+						 [BE.settings.get('keys.download') || 'd']: () => currentPost && BE.modules.downloader.downloadPost(currentPost),
+						 [BE.settings.get('keys.favorite') || 'f']: () => currentPost && BE.modules.favorites.toggle(currentPost),
+						 [BE.settings.get('keys.openOriginal') || 'o']: () => currentPost && openOriginalInNewTab(currentPost),
+						 [BE.settings.get('keys.playPause') || ' ']: () => togglePlayPause(),
+			};
+			const fn = keys[e.key];
+			if (fn) { e.preventDefault(); fn(); }
+		}
+
+		function togglePlayPause() {
+			if (mediaEl && mediaEl.tagName === 'VIDEO') {
+				mediaEl.paused ? mediaEl.play() : mediaEl.pause();
 			}
 		}
 
-		function open(postList, startIndex = 0) {
-			if (!BE.settings.get('viewer.enabled')) return;
-			posts = postList;
-			ensureRoot();
-			root.classList.remove('be-hidden');
-			document.documentElement.classList.add('be-viewer-open');
-			renderIndex(startIndex);
-			BE.bus.emit('viewer:open', { index: startIndex });
+		function resetTransform() {
+			zoom = 1; rotation = 0; flipH = false; flipV = false; panX = 0; panY = 0;
+			render();
+		}
+
+		function applyZoom(delta) {
+			setZoomAbs(Math.min(8, Math.max(0.1, zoom + delta)));
+		}
+
+		function setZoomAbs(z) {
+			zoom = z;
+			render();
+		}
+
+		function render() {
+			if (!mediaEl) return;
+			mediaEl.style.transform =
+			`translate(${panX}px, ${panY}px) scale(${zoom}) rotate(${rotation}deg) scaleX(${flipH ? -1 : 1}) scaleY(${flipV ? -1 : 1})`;
+		}
+
+		function setupDrag(el) {
+			el.addEventListener('pointerdown', (e) => {
+				if (zoom <= 1) return;
+				dragging = true;
+				dragStart = { x: e.clientX - panX, y: e.clientY - panY };
+				el.setPointerCapture(e.pointerId);
+			});
+			el.addEventListener('pointermove', (e) => {
+				if (!dragging) return;
+				panX = e.clientX - dragStart.x;
+				panY = e.clientY - dragStart.y;
+				render();
+			});
+			el.addEventListener('pointerup', () => { dragging = false; });
+			el.addEventListener('pointercancel', () => { dragging = false; });
+		}
+
+		function buildMedia(post) {
+			const isVideo = post.mediaType === 'video';
+			const el = document.createElement(isVideo ? 'video' : 'img');
+			el.style.cssText = 'max-width:90vw;max-height:75vh;object-fit:contain;cursor:grab;touch-action:none;';
+			if (isVideo) {
+				el.src = post.sampleUrl || post.previewUrl || post.originalUrl;
+				el.autoplay = BE.settings.get('viewer.autoplayVideo');
+				el.loop = BE.settings.get('viewer.loopVideo');
+				el.muted = BE.settings.get('viewer.muteVideo');
+				el.controls = true;
+				if (BE.settings.get('viewer.rememberVolume')) {
+					const vol = BE.store.get('viewer:volume', 1);
+					el.volume = vol;
+					el.addEventListener('volumechange', () => BE.store.set('viewer:volume', el.volume));
+				}
+			} else {
+				el.src = post.sampleUrl || post.previewUrl || post.originalUrl;
+				el.decoding = 'async';
+			}
+			setupDrag(el);
+			return el;
+		}
+
+		function open(post, navigation = {}) {
+			if (!overlay) init();
+			currentPost = post;
+			onNext = navigation.next || null;
+			onPrev = navigation.prev || null;
+			resetTransform();
+
+			stage.innerHTML = '';
+			mediaEl = buildMedia(post);
+			stage.appendChild(mediaEl);
+			statusEl.textContent = `#${post.id || '?'}${post.width && post.height ? ` · ${post.width}×${post.height}` : ''}`;
+
+			overlay.style.display = 'flex';
+			BE.bus.emit('viewer:open', post);
+		}
+
+		function updatePost(post) {
+			if (!currentPost || currentPost.id !== post.id) return;
+			currentPost = post;
+			if (mediaEl && post.originalUrl && mediaEl.src !== post.originalUrl) {
+				mediaEl.src = post.originalUrl;
+			}
+			statusEl.textContent = `#${post.id || '?'}${post.width && post.height ? ` · ${post.width}×${post.height}` : ''}`;
 		}
 
 		function close() {
-			if (!root) return;
-			root.classList.add('be-hidden');
-			document.documentElement.classList.remove('be-viewer-open');
-			mediaHost.innerHTML = '';
-			BE.bus.emit('viewer:close', {});
+			if (overlay) overlay.style.display = 'none';
+			if (mediaEl && mediaEl.tagName === 'VIDEO') { try { mediaEl.pause(); } catch { /* noop */ } }
+			currentPost = null;
+			onNext = null;
+			onPrev = null;
 		}
 
-		function isOpen() { return root && !root.classList.contains('be-hidden'); }
+		function isOpen() { return !!overlay && overlay.style.display === 'flex'; }
 
-		function go(delta) { renderIndex((currentIndex + delta + posts.length) % posts.length); }
-
-		function resetTransform() {
-			zoom = 1; panX = 0; panY = 0; rotation = 0; flipX = 1; flipY = 1;
-			renderTransform();
-		}
-
-		function renderTransform() {
-			const el = mediaHost.firstElementChild;
-			if (!el) return;
-			el.style.transform = `translate(${panX}px, ${panY}px) rotate(${rotation}deg) scale(${zoom * flipX}, ${zoom * flipY})`;
-		}
-
-		function applyZoom(delta, centerX, centerY) {
-			zoom = Math.max(0.1, Math.min(8, zoom + delta));
-			renderTransform();
-		}
-
-		function onWheel(e) {
-			if (!mediaHost.contains(e.target) && e.target !== mediaHost) return;
-			e.preventDefault();
-			applyZoom(e.deltaY < 0 ? 0.15 : -0.15);
-		}
-
-		function onDragStart(e) {
-			if (e.target.closest('.be-viewer-toolbar')) return;
-			dragging = true;
-			dragStart = { x: e.clientX - panX, y: e.clientY - panY };
-		}
-		function onDragMove(e) {
-			if (!dragging) return;
-			panX = e.clientX - dragStart.x;
-			panY = e.clientY - dragStart.y;
-			renderTransform();
-		}
-		function onDragEnd() { dragging = false; }
-
-		let touchState = null;
-		function onTouchStart(e) {
-			if (e.touches.length === 2) {
-				touchState = { type: 'pinch', dist: touchDist(e.touches), zoom };
-			} else if (e.touches.length === 1) {
-				touchState = { type: 'pan', x: e.touches[0].clientX - panX, y: e.touches[0].clientY - panY, startX: e.touches[0].clientX, t: Date.now() };
-			}
-		}
-		function onTouchMove(e) {
-			if (!touchState) return;
-			e.preventDefault();
-			if (touchState.type === 'pinch' && e.touches.length === 2) {
-				const d = touchDist(e.touches);
-				zoom = Math.max(0.1, Math.min(8, touchState.zoom * (d / touchState.dist)));
-				renderTransform();
-			} else if (touchState.type === 'pan' && e.touches.length === 1) {
-				panX = e.touches[0].clientX - touchState.x;
-				panY = e.touches[0].clientY - touchState.y;
-				renderTransform();
-			}
-		}
-		function onTouchEnd(e) {
-			if (touchState?.type === 'pan' && zoom <= 1.05) {
-				const dx = (e.changedTouches[0]?.clientX ?? 0) - touchState.startX;
-				const dt = Date.now() - touchState.t;
-				if (dt < 400 && Math.abs(dx) > 60) go(dx < 0 ? 1 : -1);
-			}
-			touchState = null;
-		}
-		function touchDist(touches) {
-			const [a, b] = touches;
-			return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-		}
-
-		function renderIndex(idx) {
-			currentIndex = idx;
-			resetTransform();
-			const post = posts[idx];
-			mediaHost.innerHTML = '';
-			if (!post) return;
-
-			let el;
-			if (post.mediaType === 'video') {
-				el = BE.dom.create('video', {
-					src: post.originalUrl, controls: '', autoplay: BE.settings.get('viewer.autoplayVideo') ? '' : null,
-								   loop: BE.settings.get('viewer.loopVideo') ? '' : null, playsinline: '',
-				});
-				el.muted = BE.settings.get('viewer.muteVideo');
-				if (BE.settings.get('viewer.rememberVolume')) el.volume = rememberedVolume;
-				el.addEventListener('volumechange', () => { rememberedVolume = el.volume; BE.store.set('viewer:volume', el.volume); });
-			} else {
-				el = BE.dom.create('img', { src: post.originalUrl, alt: post.id, draggable: 'false' });
-			}
-			el.className = `be-viewer-fit-${BE.settings.get('viewer.fitMode')}`;
-			mediaHost.appendChild(el);
-
-			BE.dom.qs('.be-v-counter', root).textContent = `${idx + 1} / ${posts.length}`;
-			const info = BE.dom.qs('.be-viewer-info-panel', root);
-			if (info && !info.classList.contains('be-hidden')) { info.innerHTML = ''; info.appendChild(BE.modules.imageInfo.render(post)); }
-			BE.bus.emit('viewer:navigate', { post, index: idx });
-
-			[idx + 1, idx - 1].forEach((n) => {
-				const p = posts[(n + posts.length) % posts.length];
-				if (p?.mediaType !== 'video' && p?.originalUrl) { const pre = new Image(); pre.src = p.originalUrl; }
-			});
-		}
-
-		function activeVideo() { return mediaHost?.querySelector('video') || null; }
-		function togglePlayPause() { const v = activeVideo(); if (v) v.paused ? v.play() : v.pause(); }
-		function screenshotCurrentFrame() {
-			const v = activeVideo();
-			if (!v) return null;
-			const canvas = document.createElement('canvas');
-			canvas.width = v.videoWidth; canvas.height = v.videoHeight;
-			canvas.getContext('2d').drawImage(v, 0, 0);
-			return canvas.toDataURL('image/png');
-		}
-		function stepFrame(dir) {
-			const v = activeVideo();
-			if (!v) return;
-			v.pause();
-			v.currentTime = Math.max(0, v.currentTime + dir * (1 / 30));
-		}
-		function setPlaybackRate(rate) { const v = activeVideo(); if (v) v.playbackRate = rate; }
-		function requestPiP() { const v = activeVideo(); v?.requestPictureInPicture?.().catch((e) => BE.log.warn('PiP failed', e)); }
-
-		return {
-			open, close, isOpen, go, applyZoom, resetTransform,
-			togglePlayPause, screenshotCurrentFrame, stepFrame, setPlaybackRate, requestPiP,
-			get currentPost() { return posts[currentIndex]; },
-		};
+		return { open, updatePost, close, isOpen, get currentPost() { return currentPost; } };
 	})();
 
 	/* ============================================================ *
-	 *  GALLERY — thumbnail grid enrichment, infinite scroll, bulk ops
-	 *
-	 *  v1.1.1 CHANGES:
-	 *  - Infinite scroll completely rewritten to use adapter.pagination API.
-	 *  - State machine: IDLE → LOADING → SUCCESS/ERROR/EXHAUSTED.
-	 *  - loadedPages Set prevents duplicate page loads.
-	 *  - loadedPostIds Set prevents duplicate post insertion.
-	 *  - nextPageUrl stored in JS state, not re-read from live DOM.
-	 *  - Sentinel with Retry button on error.
-	 *  - Auto-continues if sentinel still visible after a successful load.
-	 *  - No concurrent loadNextPage() calls.
+	 *  GALLERY MODULE
 	 * ============================================================ */
 	BE.modules.gallery = (() => {
+		let galleryContainer = null;
+		let scrollObserver = null;
+		let sentinel = null;
+		let nextPageUrl = null;
+		let loadedPostIds = new Set();
+		let enrichedPostIds = new Set();
 		const postCache = new Map();
-		const thumbToPost = new WeakMap();
-		let orderedPosts = [];
-		let selectionMode = false;
-		const selected = new Set();
-		let pendingIds = new Set();
-		let gridContainerEl = null;
-		let _infiniteScrollInit = false;
+		let state = 'IDLE';
+		let retryTimer = null;
+		let paginatorEl = null;
+		let paginatorHiddenByUs = false;
+		let visitedPageIdentities = new Set();
+		let settingsListenerAttached = false;
 
-		const flushBatch = BE.dom.debounce(async () => {
-			const ids = [...pendingIds];
-			pendingIds.clear();
-			if (!ids.length) return;
-			try {
-				const results = await BE.adapters.active.fetchThumbBatch(ids);
-				for (const post of results) postCache.set(post.id, post);
-				BE.bus.emit('gallery:batch-loaded', { ids, count: results.length });
-				refreshEnrichedThumbs();
-			} catch (err) {
-				BE.log.warn('thumb batch fetch failed — thumbnails stay visually enhanced, only overlay/filter metadata is unavailable', err);
+		function seedLoadedPostIds(root) {
+			// Requirement 2: loadedPostIds must represent every post already
+			// present in the gallery *before* infinite scroll can insert more.
+			// No network requests — purely a DOM scan using the active adapter.
+			let seeded = 0;
+			for (const img of BE.adapters.active.getThumbElements(root)) {
+				const postId = BE.adapters.active.getThumbPostId(img);
+				if (!postId) continue;
+				const id = String(postId);
+				if (!loadedPostIds.has(id)) {
+					loadedPostIds.add(id);
+					seeded++;
+				}
 			}
-		}, 120);
+			BE.log.debug(`[Gallery] seeded loadedPostIds with ${seeded} existing post(s), total ${loadedPostIds.size}`);
+		}
+
+		function resetPageScopedState() {
+			// Requirement 8/11: called only when a genuinely NEW gallery/page
+			// context is initialized (real SPA navigation / container swap) —
+			// never on unrelated DOM mutations of the same gallery.
+			loadedPostIds = new Set();
+			enrichedPostIds = new Set();
+			visitedPageIdentities = new Set();
+			nextPageUrl = null;
+			state = 'IDLE';
+			clearTimeout(retryTimer);
+			paginatorHiddenByUs = false;
+		}
+
+		function init(container) {
+			const isNewContainer = galleryContainer !== container;
+
+			if (isNewContainer) {
+				// Requirement 8: disconnect anything tied to the OLD container
+				// before adopting the new one.
+				if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+				if (sentinel) { sentinel.remove(); sentinel = null; }
+				resetPageScopedState();
+				restorePaginatorVisibility();
+				paginatorEl = null;
+			}
+
+			galleryContainer = container;
+
+			// Requirement 7: gallery init() must be idempotent — a marker on
+			// the container prevents re-adding delegated listeners or redoing
+			// work that's already in place for THIS container.
+			if (galleryContainer.dataset.beGalleryInit === '1') {
+				if (isNewContainer) {
+					// Shouldn't normally happen (marker would only exist on an
+					// already-adopted container), but guard anyway.
+					seedLoadedPostIds(galleryContainer);
+				}
+				applyGridSettings();
+				return;
+			}
+			galleryContainer.dataset.beGalleryInit = '1';
+			galleryContainer.classList.add('be-gallery-grid');
+
+			// Event Delegation (attached exactly once per container).
+			galleryContainer.addEventListener('click', onGalleryClick, true);
+			galleryContainer.addEventListener('pointerover', onGalleryHover, true);
+			galleryContainer.addEventListener('pointerout', onGalleryHoverEnd, true);
+
+			applyGridSettings();
+
+			if (!settingsListenerAttached) {
+				settingsListenerAttached = true;
+				BE.bus.on('settings:changed', ({ key }) => {
+					if (key.startsWith('gallery.') || key === 'general.theme' || key === 'general.accentColor') {
+						applyGridSettings();
+					}
+					if (key === 'gallery.infiniteScroll') {
+						onInfiniteScrollSettingChanged(BE.settings.get('gallery.infiniteScroll'));
+					}
+				});
+			}
+
+			enhanceThumbnails(galleryContainer);
+			seedLoadedPostIds(galleryContainer);
+		}
+
+		function onInfiniteScrollSettingChanged(enabled) {
+			if (!galleryContainer) return;
+			if (enabled) {
+				setupInfiniteScroll();
+			} else {
+				if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+				if (sentinel) { sentinel.remove(); sentinel = null; }
+				restorePaginatorVisibility();
+			}
+		}
 
 		function applyGridSettings() {
-			const container = BE.dom.qs(BE.adapters.active.gridContainerSelector);
-			if (!container) return;
-			gridContainerEl = container;
-			container.classList.add('be-gallery-grid');
-			container.classList.toggle('be-gallery-compact', !!BE.settings.get('gallery.compactMode'));
-			container.style.setProperty('--be-grid-columns', String(BE.settings.get('gallery.gridDensity') || 6));
+			if (!galleryContainer) return;
+			const cols = BE.settings.get('gallery.gridDensity') || 0;
+			const thumbSize = BE.settings.get('gallery.thumbnailSize') || 220;
+			const gap = BE.settings.get('gallery.gridGap') ?? 8;
+			const compact = BE.settings.get('gallery.compactMode');
+
+			if (cols > 0) {
+				galleryContainer.style.setProperty('--be-grid-template', `repeat(${cols}, minmax(0, 1fr))`);
+			} else {
+				galleryContainer.style.setProperty('--be-grid-template', `repeat(auto-fill, minmax(${thumbSize}px, 1fr))`);
+			}
+			galleryContainer.style.setProperty('--be-grid-gap', `${gap}px`);
+			galleryContainer.classList.toggle('be-compact-mode', compact);
 		}
 
-		function applyVisualEnhancement(img) {
-			if (img.dataset.beVisual) return;
-			img.dataset.beVisual = '1';
-			img.removeAttribute('width');
-			img.removeAttribute('height');
-			img.classList.add('be-thumb-img');
-			const wrap = img.closest('article, .thumbnail-preview, span.thumb, .post-preview') || img.parentElement;
-			wrap?.classList.add('be-thumb-wrap');
+		function orderedPostIds() {
+			if (!galleryContainer) return [];
+			return BE.adapters.active.getThumbElements(galleryContainer)
+			.map((img) => img.dataset.bePostId || BE.adapters.active.getThumbPostId(img))
+			.filter(Boolean);
 		}
 
-		function collectThumbs() {
-			return BE.adapters.active.getThumbElements().filter((img) => !img.dataset.beCollected);
-		}
+		function openViewerForThumb(img, thumb) {
+			const postId = img.dataset.bePostId || BE.adapters.active.getThumbPostId(img);
+			if (!postId) return;
 
-		function queueForFetch(img) {
-			const id = BE.adapters.active.getThumbPostId(img);
-			if (!id) return;
-			img.dataset.bePostId = id;
-			img.dataset.beEnriched = 'pending';
-			if (postCache.has(id)) { enrichThumb(img, postCache.get(id)); return; }
-			pendingIds.add(id);
-			flushBatch();
-		}
+			const previewUrl = img.src || img.dataset.src;
+			const postUrl = thumb.closest('a')?.href || img.closest('a')?.href || location.href;
 
-		function refreshEnrichedThumbs() {
-			BE.dom.qsa('img[data-be-enriched="pending"]').forEach((img) => {
-				const post = postCache.get(img.dataset.bePostId);
-				if (post) enrichThumb(img, post);
+			const minimalPost = emptyPost({
+				id: postId,
+				previewUrl,
+				sampleUrl: previewUrl,
+				postUrl,
 			});
-		}
 
-		function enrichThumb(img, post) {
-			img.dataset.beEnriched = 'done';
-			thumbToPost.set(img, post);
-			orderedPosts.push(post);
+			const ids = orderedPostIds();
+			const navigateBy = (delta) => {
+				const idx = ids.indexOf(postId);
+				const nextId = idx === -1 ? null : ids[idx + delta];
+				if (!nextId) return;
+				const nextImg = BE.dom.qs(`img[data-be-post-id="${CSS.escape(nextId)}"]`, galleryContainer)
+				|| BE.dom.qs(`img[data-be-post-id="${CSS.escape(nextId)}"]`, document);
+				if (nextImg) openViewerForThumb(nextImg, nextImg.closest('.be-thumb-wrap') || nextImg);
+			};
 
-			BE.modules.mediaLoader.applyThumbQuality(img, post);
-			const hidden = BE.modules.filters.applyToThumb(img, post);
-			if (hidden) return;
-
-			const wrap = img.closest('article, .thumbnail-preview, span.thumb, .post-preview') || img.parentElement;
-			if (!wrap || wrap.dataset.beWired) return;
-			wrap.dataset.beWired = '1';
-			wrap.classList.add('be-thumb-wrap');
-
-			const overlay = BE.dom.create('div', { class: 'be-thumb-overlay' }, [
-				BE.dom.create('button', {
-					class: `be-thumb-fav ${BE.modules.favorites.isFavorited(post.id) ? 'be-active' : ''}`,
-							  title: 'Favorite', text: '♥',
-							  onclick: (e) => { e.preventDefault(); e.stopPropagation(); const on = BE.modules.favorites.favoritePost(post, wrap); e.currentTarget.classList.toggle('be-active', on); },
-				}),
-				BE.dom.create('button', {
-					class: 'be-thumb-dl', title: 'Download original', text: '⬇',
-					onclick: (e) => { e.preventDefault(); e.stopPropagation(); BE.modules.downloader.downloadPost(post); },
-				}),
-				post.mediaType === 'video' ? BE.dom.create('span', { class: 'be-thumb-badge', text: 'VIDEO' }) : null,
-										  post.mediaType === 'gif' ? BE.dom.create('span', { class: 'be-thumb-badge', text: 'GIF' }) : null,
-			]);
-			wrap.appendChild(overlay);
-
-			if (BE.settings.get('media.hoverPreview')) {
-				let hoverTimer;
-				wrap.addEventListener('mouseenter', () => {
-					hoverTimer = setTimeout(() => showHoverPreview(wrap, post), 350);
+				BE.modules.viewer.open(minimalPost, {
+					next: () => navigateBy(1),
+									   prev: () => navigateBy(-1),
 				});
-				wrap.addEventListener('mouseleave', () => { clearTimeout(hoverTimer); hideHoverPreview(); });
-			}
 
-			img.addEventListener('click', (e) => {
-				if (selectionMode) { e.preventDefault(); toggleSelect(wrap, post); return; }
-				if (!BE.settings.get('viewer.enabled')) return;
-				if (e.button === 1 || e.ctrlKey || e.metaKey) return;
-				e.preventDefault();
-				BE.modules.viewer.open(orderedPosts, orderedPosts.indexOf(post));
-			});
-			img.addEventListener('auxclick', (e) => {
-				if (e.button === 1) { e.preventDefault(); window.open(post.originalUrl, '_blank', 'noopener'); }
-			});
+				enrichSinglePost(postId).then((fullPost) => {
+					if (fullPost) BE.modules.viewer.updatePost(fullPost);
+				}).catch((err) => BE.log.error('enrichment failed', err));
 		}
 
-		let hoverEl = null;
-		function showHoverPreview(wrap, post) {
-			hideHoverPreview();
-			hoverEl = BE.dom.create('div', { class: 'be-hover-preview' }, [
-				BE.dom.create('img', { src: post.sampleUrl || post.originalUrl }),
-			]);
-			document.body.appendChild(hoverEl);
-			const rect = wrap.getBoundingClientRect();
-			hoverEl.style.left = `${Math.min(rect.right + 12, window.innerWidth - 340)}px`;
-			hoverEl.style.top = `${Math.max(8, rect.top)}px`;
+		function buildThumbActions(wrap, img) {
+			if (wrap.querySelector('.be-thumb-actions')) return;
+			const bar = BE.dom.create('div', { class: 'be-thumb-actions' });
+			bar.style.cssText = 'position:absolute;top:4px;right:4px;display:flex;gap:3px;opacity:0;transition:opacity .15s;z-index:5;';
+			const mk = (label, title, action) => {
+				const b = document.createElement('button');
+				b.textContent = label;
+				b.title = title;
+				b.dataset.beAction = action;
+				b.className = 'be-thumb-action-btn';
+				b.style.cssText = 'background:rgba(0,0,0,.65);color:#fff;border:none;border-radius:3px;padding:2px 5px;font-size:11px;cursor:pointer;line-height:1.4;';
+				bar.appendChild(b);
+			};
+			mk('👁', 'Open viewer', 'viewer');
+			mk('⭳', 'Download', 'download');
+			mk('⤢', 'Open original', 'open');
+			if (BE.modules.favorites.supported()) mk('★', 'Favorite', 'favorite');
+			wrap.appendChild(bar);
+			wrap.addEventListener('pointerenter', () => { bar.style.opacity = '1'; });
+			wrap.addEventListener('pointerleave', () => { bar.style.opacity = '0'; });
 		}
-		function hideHoverPreview() { hoverEl?.remove(); hoverEl = null; }
 
-		function toggleSelect(wrap, post) {
-			if (selected.has(post.id)) { selected.delete(post.id); wrap.classList.remove('be-selected'); }
-			else { selected.add(post.id); wrap.classList.add('be-selected'); }
-			BE.bus.emit('gallery:selection-changed', { count: selected.size });
-		}
-		function setSelectionMode(on) {
-			selectionMode = on;
-			document.documentElement.classList.toggle('be-selection-mode', on);
-			if (!on) { selected.clear(); BE.dom.qsa('.be-selected').forEach((el) => el.classList.remove('be-selected')); }
-		}
-		function selectedPosts() { return [...selected].map((id) => postCache.get(id)).filter(Boolean); }
-
-		function scan() {
-			applyGridSettings();
-			const thumbs = collectThumbs();
+		function enhanceThumbnails(root) {
+			const thumbs = BE.adapters.active.getThumbElements(root);
 			for (const img of thumbs) {
-				img.dataset.beCollected = '1';
-				applyVisualEnhancement(img);
-				BE.dom.onVisible(img, queueForFetch);
+				const wrap = img.closest('article, span, div, a') || img.parentElement;
+				if (wrap) {
+					wrap.classList.add('be-thumb-wrap');
+					if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+					buildThumbActions(wrap, img);
+				}
+				img.classList.add('be-thumb-img');
+
+				const postId = BE.adapters.active.getThumbPostId(img);
+				if (postId) {
+					img.dataset.bePostId = postId;
+				}
 			}
 		}
 
-		/* ============================================================
-		 *  INFINITE SCROLL — v1.1.1 Rewrite
-		 *
-		 *  State machine:
-		 *    IDLE → LOADING → SUCCESS → (READY_FOR_NEXT or EXHAUSTED)
-		 *                    → ERROR → (RETRY or EXHAUSTED)
-		 *
-		 *  Pagination discovery (all delegated to adapter.pagination):
-		 *    1. adapter.pagination.getNextUrl(fetchedDoc) — explicit next link
-		 *    2. adapter.pagination.calculateNextUrl(currentUrl) — calculated
-		 *    3. EXHAUSTED only when both fail AND fetched page had no new posts
-		 * ============================================================ */
-		function initInfiniteScroll() {
-			if (_infiniteScrollInit) return;
-			if (!BE.settings.get('gallery.infiniteScroll')) return;
-			_infiniteScrollInit = true;
+		async function handleThumbAction(action, img, thumb) {
+			const postId = img.dataset.bePostId || BE.adapters.active.getThumbPostId(img);
+			if (!postId) return;
+			const previewUrl = img.src || img.dataset.src;
+			const postUrl = thumb.closest('a')?.href || img.closest('a')?.href || location.href;
+			let post = emptyPost({ id: postId, previewUrl, sampleUrl: previewUrl, postUrl });
 
-			const adapter = BE.adapters.active;
-			if (!adapter.pagination) {
-				BE.log.warn('[Gallery] adapter has no pagination API — infinite scroll disabled');
+			if (action === 'viewer') {
+				openViewerForThumb(img, thumb);
 				return;
 			}
 
-			const pag = adapter.pagination;
-			const container = BE.dom.qs(adapter.gridContainerSelector) || document.body;
-			if (!container) return;
-
-			// Find and hide native paginator using reversible class.
-			const findPaginator = (root) => {
-				const sels = pag.containerSelectors || ['.pagination', '#paginator'];
-				for (const s of sels) {
-					const el = BE.dom.qs(s, root);
-					if (el) return el;
-				}
-				return null;
-			};
-			const nativePaginator = findPaginator(document);
-			if (nativePaginator) {
-				nativePaginator.classList.add('be-pagination-hidden');
+			// download/open/favorite need real metadata (original URL) first.
+			try {
+				const full = await enrichSinglePost(postId);
+				if (full) post = full;
+			} catch (err) {
+				BE.log.warn('[Gallery] could not enrich post before action', action, err);
 			}
 
-			// --- State ---
-			const state = {
-				status: 'IDLE',
-				nextPageUrl: pag.getNextUrl(document),
-						  loadedPages: new Set(),
-						  loadedPostIds: new Set(),
-						  error: null,
-						  consecutiveEmptyPages: 0,
-			};
-
-			// Seed: mark current page identity as loaded.
-			const currentPageId = pag.getPageIdentity(location.href);
-			state.loadedPages.add(currentPageId);
-
-			// Seed: mark current page's posts as loaded (for dedup).
-			const initThumbs = adapter.getThumbElements();
-			for (const img of initThumbs) {
-				const pid = pag.getPostIdentity(img);
-				if (pid) state.loadedPostIds.add(pid);
+			if (action === 'download') {
+				BE.modules.downloader.downloadPost(post);
+			} else if (action === 'open') {
+				const url = post.originalUrl || post.sampleUrl || post.previewUrl;
+				if (url) window.open(url, '_blank', 'noopener');
+			} else if (action === 'favorite') {
+				BE.modules.favorites.toggle(post);
 			}
-
-			BE.log.debug('[Gallery] pagination initialized', {
-				currentPage: location.href,
-				pageIdentity: currentPageId,
-				nextPageUrl: state.nextPageUrl,
-				initialPostCount: state.loadedPostIds.size,
-			});
-
-			// --- Sentinel element with dynamic status UI ---
-			const sentinel = BE.dom.create('div', { class: 'be-scroll-sentinel' });
-			container.appendChild(sentinel);
-
-			/** Render the sentinel's content based on current state. */
-			function renderSentinel(status, message, showRetry, retryUrl) {
-				sentinel.innerHTML = '';
-				const text = BE.dom.create('span', { class: 'be-sentinel-text', text: message });
-				sentinel.appendChild(text);
-				if (showRetry) {
-					const retryBtn = BE.dom.create('button', {
-						class: 'be-sentinel-retry',
-						text: 'Retry',
-						onclick: (e) => {
-							e.preventDefault();
-							if (retryUrl) {
-								state.nextPageUrl = retryUrl;
-								loadNextPage();
-							}
-						},
-					});
-					sentinel.appendChild(retryBtn);
-				}
-			}
-
-			renderSentinel('IDLE', 'Scroll for more…', false);
-
-			// --- Loading state guard ---
-			let loading = false;
-
-			/** Validate that the fetched response is a real gallery page
-			 *  with post thumbnails, not an error/login page. */
-			function validateResponse(doc) {
-				// Check for login page indicators
-				const title = (doc.title || '').toLowerCase();
-				if (/log\s*in|sign\s*in|not\s*found|error|access\s*denied/.test(title)) {
-					// Title-based heuristic — but some valid pages have "login" in nav,
-					// so only treat as login page if there's a password field.
-					if (doc.querySelector('input[type="password"]')) {
-						return { valid: false, reason: 'Response appears to be a login page' };
-					}
-				}
-				// Check for gallery container
-				const newContainer = doc.querySelector(adapter.gridContainerSelector);
-				if (!newContainer) {
-					return { valid: false, reason: 'Gallery container not found in response' };
-				}
-				return { valid: true, container: newContainer };
-			}
-
-			/** The main load function. Guarded against concurrent calls. */
-			async function loadNextPage() {
-				if (loading) {
-					BE.log.debug('[Gallery] loadNextPage() called while already loading — ignored');
-					return;
-				}
-				if (state.status === 'EXHAUSTED') return;
-
-				// If we don't have a next URL, try calculating one.
-				if (!state.nextPageUrl) {
-					BE.log.debug('[Gallery] no next URL from site, trying calculated fallback');
-					const calc = pag.calculateNextUrl?.(location.href);
-					if (calc) {
-						state.nextPageUrl = calc;
-					} else {
-						state.status = 'EXHAUSTED';
-						renderSentinel('EXHAUSTED', 'No more posts', false);
-						return;
-					}
-				}
-
-				// Dedup: check page identity
-				const pageId = pag.getPageIdentity(state.nextPageUrl);
-				if (state.loadedPages.has(pageId)) {
-					BE.log.debug(`[Gallery] page identity "${pageId}" already loaded — advancing`);
-					const calc = pag.calculateNextUrl?.(state.nextPageUrl);
-					if (calc) {
-						state.nextPageUrl = calc;
-						loadNextPage();
-						return;
-					}
-					state.status = 'EXHAUSTED';
-					renderSentinel('EXHAUSTED', 'No more posts', false);
-					return;
-				}
-
-				// --- Begin loading ---
-				loading = true;
-				state.status = 'LOADING';
-				renderSentinel('LOADING', 'Loading more…', false);
-				BE.log.debug('[Gallery] requesting next page:', state.nextPageUrl);
-
-				const requestUrl = state.nextPageUrl;
-
-				try {
-					const res = await BE.net.request({ url: requestUrl }, 2);
-
-					// HTTP status validation
-					if (!res || res.status < 200 || res.status >= 300) {
-						throw new Error(`HTTP ${res?.status || 'unknown'}`);
-					}
-					if (!res.responseText || res.responseText.length < 200) {
-						throw new Error('Empty or truncated response');
-					}
-
-					const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
-
-					// Validate the response is a real gallery page
-					const validation = validateResponse(doc);
-					if (!validation.valid) {
-						throw new Error(validation.reason);
-					}
-					const newContainer = validation.container;
-
-					// Extract thumbnail images from the fetched document
-					const newThumbImgs = BE.dom.qsa(
-						'.thumbnail-preview img, article.thumbnail-preview img, span.thumb img, #post-list img.preview, #post-list-posts img, .thumb img, article.post-preview img, a.thumb img, img.preview',
-						newContainer,
-					).filter((img) => {
-						// Filter: must have a recognizable post ID
-						return pag.getPostIdentity(img) || adapter.getThumbPostId(img);
-					});
-
-					if (!newThumbImgs.length) {
-						// No thumbnails found — could be end of results or error page
-						BE.log.debug('[Gallery] no post thumbnails found in response');
-						state.consecutiveEmptyPages++;
-						if (state.consecutiveEmptyPages >= 2) {
-							state.status = 'EXHAUSTED';
-							renderSentinel('EXHAUSTED', 'No more posts', false);
-							loading = false;
-							return;
-						}
-						// Try advancing via calculated URL
-						const calc = pag.calculateNextUrl?.(requestUrl);
-						if (calc) {
-							state.nextPageUrl = calc;
-							loading = false;
-							loadNextPage();
-							return;
-						}
-						state.status = 'EXHAUSTED';
-						renderSentinel('EXHAUSTED', 'No more posts', false);
-						loading = false;
-						return;
-					}
-
-					// Extract next URL from the fetched document BEFORE mutating DOM.
-					// This is critical: we store it in JS state so we never need
-					// to re-read the live paginator after DOM replacement.
-					const newNextUrl = pag.getNextUrl(doc);
-					BE.log.debug('[Gallery] received next page', {
-						postCount: newThumbImgs.length,
-						nextDetected: newNextUrl || '(none)',
-					});
-
-					// Insert unique posts
-					let inserted = 0;
-					let skipped = 0;
-					for (const img of newThumbImgs) {
-						const postId = pag.getPostIdentity(img) || adapter.getThumbPostId(img);
-						if (!postId) continue;
-						if (state.loadedPostIds.has(postId)) {
-							skipped++;
-							continue;
-						}
-						state.loadedPostIds.add(postId);
-
-						// Find the wrapper element to insert (not just the img)
-						const wrap = img.closest('article, .thumbnail-preview, span.thumb, .post-preview, li, div.thumb') || img.parentElement;
-						const node = wrap || img;
-						// Insert before the sentinel to maintain correct order
-						container.insertBefore(node, sentinel);
-						inserted++;
-					}
-
-					BE.log.debug(`[Gallery] extracted posts: ${newThumbImgs.length}, inserted: ${inserted}, duplicate posts skipped: ${skipped}`);
-
-					// Mark this page as loaded
-					state.loadedPages.add(pageId);
-
-					// Update next URL for the next cycle
-					if (newNextUrl) {
-						state.nextPageUrl = newNextUrl;
-					} else {
-						// No explicit next link in the response — try calculated
-						const calc = pag.calculateNextUrl?.(requestUrl);
-						state.nextPageUrl = calc || null;
-					}
-
-					// Decide next state
-					if (inserted === 0 && skipped === newThumbImgs.length) {
-						// All posts were duplicates — try advancing
-						state.consecutiveEmptyPages++;
-						if (state.consecutiveEmptyPages >= 3 || !state.nextPageUrl) {
-							state.status = 'EXHAUSTED';
-							renderSentinel('EXHAUSTED', 'No more posts', false);
-							loading = false;
-							return;
-						}
-						BE.log.debug('[Gallery] all posts were duplicates, trying next page');
-						loading = false;
-						loadNextPage();
-						return;
-					}
-
-					// Success — reset empty counter
-					state.consecutiveEmptyPages = 0;
-
-					if (!state.nextPageUrl) {
-						state.status = 'EXHAUSTED';
-						renderSentinel('EXHAUSTED', 'No more posts', false);
-					} else {
-						state.status = 'SUCCESS';
-						renderSentinel('SUCCESS', 'Scroll for more…', false);
-					}
-
-					// Process newly inserted thumbnails through the gallery pipeline
-					// (visual enhancement, metadata fetch, filters, overlays, viewer)
-					scan();
-
-					// If the sentinel is still visible after insertion (e.g.
-					// on very large monitors where one page doesn't fill the
-					// viewport), automatically continue loading the next page.
-					if (state.status !== 'EXHAUSTED') {
-						setTimeout(() => {
-							if (loading) return;
-							const rect = sentinel.getBoundingClientRect();
-							const isVisible = rect.top < (window.innerHeight + 1200);
-							if (isVisible) {
-								BE.log.debug('[Gallery] sentinel still visible after load — auto-continuing');
-								loadNextPage();
-							}
-						}, 150);
-					}
-
-				} catch (err) {
-					BE.log.error('[Gallery] pagination error:', err.message || err);
-					state.error = err;
-					state.status = 'ERROR';
-					// Show retry UI with the URL that failed
-					renderSentinel('ERROR', 'Unable to load the next page.', true, requestUrl);
-				} finally {
-					loading = false;
-				}
-			}
-
-			// --- IntersectionObserver ---
-			// Observes the sentinel and triggers loadNextPage() when it
-			// enters the viewport. The observer stays active for the
-			// lifetime of the gallery — it is never disconnected.
-			const io = new IntersectionObserver((entries) => {
-				if (state.status === 'EXHAUSTED') return;
-				if (loading) return;
-				for (const e of entries) {
-					if (e.isIntersecting) {
-						loadNextPage();
-						break;
-					}
-				}
-			}, { rootMargin: '1200px 0px' });
-			io.observe(sentinel);
-
-			// Expose for debugging
-			BE.modules.gallery._scrollState = state;
 		}
 
+		function onGalleryClick(e) {
+			// Per-thumbnail action buttons (download/open/favorite/viewer overlay).
+			const actionBtn = e.target.closest('[data-be-action]');
+			if (actionBtn) {
+				const wrap = actionBtn.closest('.be-thumb-wrap');
+				const img = wrap?.querySelector('img');
+				if (img) {
+					e.preventDefault();
+					e.stopPropagation();
+					handleThumbAction(actionBtn.dataset.beAction, img, wrap);
+				}
+				return;
+			}
+
+			if (!BE.settings.get('viewer.enabled')) return;
+
+			// Never hijack modifier-key clicks or middle-clicks — let the
+			// browser/site handle "open in new tab", "open in background", etc.
+			if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+
+			const thumb = e.target.closest('.be-thumb-wrap, article, span.thumb, a.thumb, .post-preview');
+			if (!thumb) return;
+
+			const img = thumb.matches('img') ? thumb : thumb.querySelector('img');
+			if (!img) return;
+
+			e.preventDefault();
+			e.stopPropagation();
+			openViewerForThumb(img, thumb);
+		}
+
+		function onGalleryHover(e) {
+			if (!BE.settings.get('media.hoverPreview')) return;
+			const thumb = e.target.closest('.be-thumb-wrap, article, span.thumb, a.thumb, .post-preview');
+			if (!thumb) return;
+			const img = thumb.matches('img') ? thumb : thumb.querySelector('img');
+			if (img) BE.modules.hover.show(img);
+		}
+
+		function onGalleryHoverEnd() {
+			if (!BE.settings.get('media.hoverPreview')) return;
+			BE.modules.hover.hide();
+		}
+
+		async function enrichSinglePost(postId) {
+			if (postCache.has(postId)) return postCache.get(postId);
+			try {
+				const post = await BE.adapters.active.fetchPost(postId);
+				if (post) postCache.set(postId, post);
+				return post;
+			} catch (err) {
+				BE.log.debug('[Gallery] enrichSinglePost failed for', postId, err);
+				return null;
+			}
+		}
+
+		// Background metadata enrichment: batch-fetch original-media URLs for
+		// visible thumbnails so download/viewer/favorite don't have to make a
+		// per-click network round-trip afterwards. Never blocks initial render.
+		async function enrichThumbnails(root = galleryContainer) {
+			if (!root || !BE.adapters.active || typeof BE.adapters.active.fetchThumbBatch !== 'function') return;
+
+			const ids = BE.adapters.active.getThumbElements(root)
+			.map((img) => img.dataset.bePostId || BE.adapters.active.getThumbPostId(img))
+			.filter((id) => id && !enrichedPostIds.has(id));
+			if (!ids.length) return;
+
+			const CHUNK = 40;
+			for (let i = 0; i < ids.length; i += CHUNK) {
+				const chunk = ids.slice(i, i + CHUNK);
+				chunk.forEach((id) => enrichedPostIds.add(id));
+				try {
+					const posts = await BE.adapters.active.fetchThumbBatch(chunk);
+					for (const post of posts || []) {
+						if (!post?.id) continue;
+						postCache.set(String(post.id), post);
+						const img = BE.dom.qs(`img[data-be-post-id="${CSS.escape(String(post.id))}"]`, root);
+						if (img && post.originalUrl) img.dataset.beOriginalUrl = post.originalUrl;
+					}
+					BE.log.debug(`[Gallery] enriched ${posts?.length || 0}/${chunk.length} thumbnails`);
+				} catch (err) {
+					BE.log.debug('[Gallery] batch enrichment failed for chunk', err);
+				}
+			}
+		}
+
+		function findPaginatorEl() {
+			const selectors = BE.adapters.active.pagination.containerSelectors.join(', ');
+			if (!selectors) return null;
+			try { return BE.dom.qs(selectors); } catch { return null; }
+		}
+
+		function hidePaginatorIfPresent() {
+			paginatorEl = paginatorEl || findPaginatorEl();
+			if (paginatorEl && !paginatorEl.classList.contains('be-pagination-hidden')) {
+				paginatorEl.classList.add('be-pagination-hidden');
+				paginatorHiddenByUs = true;
+			}
+		}
+
+		function restorePaginatorVisibility() {
+			if (paginatorHiddenByUs && paginatorEl) {
+				paginatorEl.classList.remove('be-pagination-hidden');
+			}
+			paginatorHiddenByUs = false;
+		}
+
+		function setupInfiniteScroll() {
+			// Requirement 6: fully idempotent — never leaves more than one
+			// observer/sentinel behind, however many times this is called
+			// (SPA nav, MutationObserver, settings toggling, re-detection).
+			if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+			const existingSentinel = document.getElementById('be-infinite-scroll-sentinel');
+			if (existingSentinel) existingSentinel.remove();
+			sentinel = null;
+
+			if (!galleryContainer) return;
+
+			sentinel = document.createElement('div');
+			sentinel.id = 'be-infinite-scroll-sentinel';
+			sentinel.style.height = '10px';
+			galleryContainer.parentNode.insertBefore(sentinel, galleryContainer.nextSibling);
+
+			scrollObserver = new IntersectionObserver((entries) => {
+				if (entries[0].isIntersecting && state === 'IDLE') {
+					loadNextPage();
+				}
+			}, { rootMargin: '600px 0px' });
+
+			scrollObserver.observe(sentinel);
+
+			// Requirement 5: do NOT hide the native paginator up front — only
+			// once infinite scroll has proven it can actually load a page.
+			paginatorEl = findPaginatorEl();
+		}
+
+		async function loadNextPage() {
+			if (state !== 'IDLE') return;
+			state = 'LOADING';
+			clearTimeout(retryTimer);
+
+			// Requirement 1 fix: use a mutable local so a successfully
+			// calculated fallback URL is actually used for the request below.
+			let nextUrl = nextPageUrl || BE.adapters.active.pagination.getNextUrl(document);
+			if (!nextUrl) {
+				const calc = BE.adapters.active.pagination.calculateNextUrl(location.href);
+				if (!calc) {
+					state = 'EXHAUSTED';
+					BE.log.info('[Gallery] No more pages. Next URL not found.');
+					return;
+				}
+				nextUrl = calc;
+				nextPageUrl = calc;
+			}
+
+			// Requirement 11: never re-request an already-visited page.
+			const nextIdentity = BE.adapters.active.pagination.getPageIdentity(nextUrl);
+			if (visitedPageIdentities.has(nextIdentity)) {
+				state = 'EXHAUSTED';
+				BE.log.info(`[Gallery] Pagination loop detected (identity "${nextIdentity}" already visited). Stopping.`);
+				return;
+			}
+
+			BE.log.debug('[Gallery] infinite scroll triggered');
+			BE.log.debug(`[Gallery] next URL: ${nextUrl}`);
+			BE.log.debug(`[Gallery] pagination identity: ${nextIdentity}`);
+			BE.log.debug('[Gallery] request started');
+
+			try {
+				const res = await BE.net.request({ url: nextUrl, headers: { 'Accept': 'text/html' } }, 3);
+				BE.log.debug(`[Gallery] HTTP status: ${res.status}`);
+				BE.log.debug(`[Gallery] response length: ${res.responseText.length}`);
+
+				if (res.responseText.includes('login') && res.responseText.includes('password')) {
+					throw new Error('Login page returned instead of gallery.');
+				}
+				if (res.status === 403 || res.status === 404 || res.status === 500) {
+					throw new Error(`HTTP ${res.status} error page returned.`);
+				}
+
+				visitedPageIdentities.add(nextIdentity);
+
+				const doc = new DOMParser().parseFromString(res.responseText, 'text/html');
+				const newContainer = BE.adapters.active.getGalleryContainer(doc);
+
+				if (!newContainer) {
+					throw new Error('Gallery container not found in response.');
+				}
+				BE.log.debug('[Gallery] gallery container found');
+
+				const thumbs = BE.adapters.active.getThumbElements(newContainer);
+				BE.log.debug(`[Gallery] thumbnails found: ${thumbs.length}`);
+
+				if (!thumbs.length) {
+					state = 'EXHAUSTED';
+					BE.log.info('[Gallery] Empty valid page. No more posts.');
+					restorePaginatorVisibility();
+					return;
+				}
+
+				let inserted = 0;
+				for (const thumb of thumbs) {
+					const img = thumb.tagName === 'IMG' ? thumb : thumb.querySelector('img');
+					if (!img) continue;
+
+					const rawPostId = BE.adapters.active.getThumbPostId(img);
+					if (!rawPostId) continue;
+					const postId = String(rawPostId);
+					if (loadedPostIds.has(postId)) continue;
+
+					loadedPostIds.add(postId);
+
+					const wrap = thumb.closest('article, span, div, a') || thumb.parentElement;
+					if (!wrap) continue;
+
+					const clonedWrap = wrap.cloneNode(true);
+					clonedWrap.classList.add('be-thumb-wrap');
+					const clonedImg = clonedWrap.querySelector('img') || clonedWrap;
+					clonedImg.classList.add('be-thumb-img');
+					clonedImg.dataset.bePostId = postId;
+
+					galleryContainer.appendChild(clonedWrap);
+					inserted++;
+				}
+				BE.log.debug(`[Gallery] unique posts: ${inserted}`);
+				BE.log.debug(`[Gallery] inserted: ${inserted}`);
+
+				nextPageUrl = BE.adapters.active.pagination.getNextUrl(doc);
+				if (!nextPageUrl) {
+					const calculated = BE.adapters.active.pagination.calculateNextUrl(nextUrl);
+					nextPageUrl = calculated;
+				}
+
+				if (!nextPageUrl) {
+					state = 'EXHAUSTED';
+					BE.log.info('[Gallery] No more pages. Next URL not found in response.');
+					restorePaginatorVisibility();
+				} else if (inserted === 0) {
+					// Requirement 10: a page can be fetched successfully yet
+					// contain zero *unique* posts (fully overlapping page).
+					// Continue the chain (the loop guard above still protects
+					// against A→B→A / repeated-URL loops), but don't spin
+					// forever if this keeps happening with no forward progress.
+					BE.log.debug('[Gallery] page contained no new posts; continuing pagination chain');
+					state = 'IDLE';
+					hidePaginatorIfPresent();
+				} else {
+					BE.log.debug(`[Gallery] next URL detected: ${nextPageUrl}`);
+					state = 'IDLE';
+					// Requirement 5: only now, after a demonstrated successful
+					// load, is it safe to hide the native paginator.
+					hidePaginatorIfPresent();
+				}
+
+			} catch (err) {
+				BE.log.error('[Gallery] pagination error', err);
+				BE.log.error(`[Gallery] URL: ${nextUrl}`);
+				BE.log.error(`[Gallery] reason: ${err.message}`);
+				state = 'ERROR';
+				// Requirement 5: on failure, make sure the user isn't stranded —
+				// restore the native paginator rather than leaving it hidden.
+				restorePaginatorVisibility();
+				retryTimer = setTimeout(() => {
+					state = 'IDLE';
+					loadNextPage();
+				}, 5000);
+			}
+		}
+
+		return { init, applyGridSettings, enhanceThumbnails, enrichThumbnails, setupInfiniteScroll };
+	})();
+
+	/* ============================================================ *
+	 *  UI MODULE (Settings & Toolbar)
+	 * ============================================================ */
+	BE.modules.ui = (() => {
+		let toolbarRoot = null;
+		let postActionBar = null;
+		let currentPostCache = null;
+
+		function injectStyles() {
+			const css = `
+			:root {
+				--be-accent: ${BE.settings.get('general.accentColor') || '#ff8ac6'};
+			}
+			.be-gallery-grid {
+				display: grid;
+				grid-template-columns: var(--be-grid-template, repeat(auto-fill, minmax(var(--be-thumbnail-size, 220px), 1fr)));
+				gap: var(--be-grid-gap, 8px);
+				align-items: stretch;
+			}
+			.be-thumb-wrap {
+				position: relative;
+				overflow: hidden;
+				min-width: 0;
+				min-height: 0;
+				aspect-ratio: 3/4;
+				background: rgba(128,128,128,0.1);
+				border-radius: 4px;
+			}
+			.be-thumb-img {
+				display: block;
+				width: 100%;
+				height: 100%;
+				max-width: 100%;
+				max-height: 100%;
+				object-fit: contain;
+			}
+			.be-pagination-hidden {
+				display: none !important;
+			}
+			#be-root {
+			position: fixed;
+			z-index: 999999;
+			font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+			}
+			#be-root.be-pos-bottom-right { bottom: 10px; right: 10px; }
+			#be-root.be-pos-bottom-left  { bottom: 10px; left: 10px; }
+			#be-root.be-pos-top-right    { top: 10px; right: 10px; }
+			#be-root.be-pos-top-left     { top: 10px; left: 10px; }
+			.be-toolbar {
+				display: flex;
+				gap: 4px;
+				background: rgba(20,20,20,0.85);
+				padding: 6px;
+				border-radius: 8px;
+				box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+			}
+			.be-toolbar-btn {
+				background: var(--be-accent);
+				color: #fff;
+				border: none;
+				padding: 7px 10px;
+				border-radius: 5px;
+				cursor: pointer;
+				font-weight: bold;
+				font-size: 12px;
+				white-space: nowrap;
+			}
+			.be-toolbar-btn:disabled {
+				background: #666;
+				cursor: not-allowed;
+				opacity: 0.6;
+			}
+			.be-post-action-bar {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 6px;
+				margin: 8px 0;
+				padding: 6px;
+				background: rgba(128,128,128,0.08);
+				border-radius: 6px;
+			}
+			.be-post-action-bar button {
+				background: var(--be-accent);
+				color: #fff;
+				border: none;
+				padding: 6px 10px;
+				border-radius: 4px;
+				cursor: pointer;
+				font-size: 12px;
+			}
+			.be-post-action-bar button:disabled {
+				background: #999;
+				cursor: not-allowed;
+				opacity: 0.6;
+			}
+			.be-settings-panel {
+				position: fixed;
+				top: 50px;
+				right: 10px;
+				width: 340px;
+				max-height: 80vh;
+				overflow-y: auto;
+				background: #fff;
+				color: #000;
+				border: 1px solid #ccc;
+				padding: 15px;
+				z-index: 999999;
+				box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+				font-family: sans-serif;
+			}
+			.be-settings-panel h3 {
+				margin-top: 15px;
+				margin-bottom: 5px;
+				border-bottom: 1px solid #eee;
+				padding-bottom: 5px;
+			}
+			.be-settings-row {
+				margin-bottom: 10px;
+			}
+			.be-settings-row label {
+				display: block;
+				font-size: 12px;
+				margin-bottom: 4px;
+				font-weight: bold;
+			}
+			.be-settings-toolbar {
+				display: flex;
+				gap: 6px;
+				flex-wrap: wrap;
+				margin-bottom: 10px;
+				padding-bottom: 10px;
+				border-bottom: 1px solid #ddd;
+			}
+			.be-settings-toolbar button {
+				flex: 1;
+				background: var(--be-accent);
+				color: #fff;
+				border: none;
+				padding: 6px 8px;
+				border-radius: 4px;
+				cursor: pointer;
+				font-size: 11px;
+			}
+			`;
+			_GM.addStyle(css);
+		}
+
+		/* ---- current-post resolution (works on post pages, cached) ---- */
+		async function getCurrentPost(forceRefresh = false) {
+			if (currentPostCache && !forceRefresh) return currentPostCache;
+			if (!BE.adapters.active) return null;
+			try {
+				const isPost = typeof BE.adapters.active.isPostPage === 'function' && BE.adapters.active.isPostPage();
+				if (!isPost) return null;
+				const id = BE.adapters.active.getPostId?.();
+				if (!id) return null;
+				const post = await BE.adapters.active.fetchPost(id);
+				if (post) currentPostCache = post;
+				return post;
+			} catch (err) {
+				BE.log.warn('[UI] could not resolve current post', err);
+				return null;
+			}
+		}
+
+		function findPrevNextLinks() {
+			const sels = {
+				next: ['a[rel="next"]', 'a.next-post', 'a#post-next', '.next-post a', 'a.next_page[href*="/posts/"]'],
+				prev: ['a[rel="prev"]', 'a.prev-post', 'a#post-prev', '.prev-post a', 'a.prev_page[href*="/posts/"]'],
+			};
+			const find = (list) => { for (const s of list) { const el = BE.dom.qs(s); if (el?.href) return el.href; } return null; };
+			return { next: find(sels.next), prev: find(sels.prev) };
+		}
+
+		function makeActionHandlers() {
+			return {
+				async download() {
+					const post = await getCurrentPost();
+					if (!post) { BE.modules.toast.show('No post detected on this page', 'warn'); return; }
+					BE.modules.downloader.downloadPost(post);
+				},
+				async openOriginal() {
+					const post = await getCurrentPost();
+					const url = post?.originalUrl || post?.sampleUrl || post?.previewUrl;
+					if (!url) { BE.modules.toast.show('Original media URL not found', 'warn'); return; }
+					const mode = BE.settings.get('download.openMode');
+					if (mode === 'popup') window.open(url, '_blank', 'width=1000,height=800');
+					else window.open(url, '_blank', 'noopener');
+				},
+				async viewer() {
+					const post = await getCurrentPost();
+					if (!post) { BE.modules.toast.show('No post detected on this page', 'warn'); return; }
+					BE.modules.viewer.open(post);
+				},
+				async favorite() {
+					const post = await getCurrentPost();
+					if (!post) { BE.modules.toast.show('No post detected on this page', 'warn'); return; }
+					BE.modules.favorites.toggle(post);
+				},
+				prev() {
+					const { prev } = findPrevNextLinks();
+					if (prev) location.href = prev; else BE.modules.toast.show('No previous post found', 'warn');
+				},
+				next() {
+					const { next } = findPrevNextLinks();
+					if (next) location.href = next; else BE.modules.toast.show('No next post found', 'warn');
+				},
+			};
+		}
+
+		function createToolbar() {
+			removeToolbar();
+			const root = BE.dom.create('div', { id: 'be-root' });
+			root.className = `be-pos-${BE.settings.get('general.toolbarPosition') || 'bottom-right'}`;
+
+			const bar = BE.dom.create('div', { class: 'be-toolbar' });
+			const actions = makeActionHandlers();
+			const onPostPage = !!(BE.adapters.active?.isPostPage?.());
+			const hasFav = BE.modules.favorites.supported();
+			const { prev, next } = onPostPage ? findPrevNextLinks() : {};
+
+			const specs = [
+				['Settings', () => createSettingsPanel(), true],
+					 ['Viewer', actions.viewer, onPostPage],
+					 ['Download', actions.download, onPostPage],
+					 ['Open Original', actions.openOriginal, onPostPage],
+					 ['Favorite', actions.favorite, onPostPage && hasFav],
+					 ['Prev', actions.prev, onPostPage && !!prev],
+					 ['Next', actions.next, onPostPage && !!next],
+			];
+			for (const [label, fn, enabled] of specs) {
+				const btn = document.createElement('button');
+				btn.className = 'be-toolbar-btn';
+				btn.textContent = label;
+				btn.disabled = !enabled;
+				btn.title = enabled ? label : `${label} — not available on this page`;
+				btn.addEventListener('click', () => fn && fn());
+				bar.appendChild(btn);
+			}
+			root.appendChild(bar);
+			document.body.appendChild(root);
+			toolbarRoot = root;
+		}
+
+		function removeToolbar() {
+			toolbarRoot?.remove();
+			toolbarRoot = null;
+		}
+
+		function createPostActionBar() {
+			postActionBar?.remove();
+			postActionBar = null;
+			if (!BE.adapters.active?.isPostPage?.()) return;
+
+			const mediaEl = BE.dom.qs('#image, #main_image, .image-container, main img.post-image, video');
+			if (!mediaEl) return;
+
+			const bar = BE.dom.create('div', { class: 'be-post-action-bar' });
+			const actions = makeActionHandlers();
+			const hasFav = BE.modules.favorites.supported();
+			const specs = [
+				['Download', actions.download, true],
+				['Open Original', actions.openOriginal, true],
+				['Fullscreen', actions.viewer, true],
+				['Favorite', actions.favorite, hasFav],
+				['Reverse Search', async () => {
+					const post = await getCurrentPost();
+					const url = post?.sampleUrl || post?.previewUrl || post?.originalUrl;
+					if (url) window.open(`https://saucenao.com/search.php?url=${encodeURIComponent(url)}`, '_blank', 'noopener');
+				}, true],
+				['Info', async () => {
+					const post = await getCurrentPost();
+					if (!post) return;
+					BE.modules.toast.show(
+						`#${post.id} · ${post.width}x${post.height} · ${post.rating} · score ${post.score}`,
+						'info', 4000,
+					);
+				}, true],
+			];
+			for (const [label, fn, enabled] of specs) {
+				const btn = document.createElement('button');
+				btn.textContent = label;
+				btn.disabled = !enabled;
+				btn.addEventListener('click', () => fn && fn());
+				bar.appendChild(btn);
+			}
+
+			const host = mediaEl.closest('div, section, article') || mediaEl.parentElement;
+			(host || document.body).insertAdjacentElement('afterend', bar);
+			postActionBar = bar;
+		}
+
+		function createSettingsPanel() {
+			let panel = document.getElementById('be-settings-panel');
+			if (panel) {
+				panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+				return;
+			}
+
+			panel = document.createElement('div');
+			panel.id = 'be-settings-panel';
+			panel.className = 'be-settings-panel';
+
+			const topBar = document.createElement('div');
+			topBar.className = 'be-settings-toolbar';
+			const mkTop = (label, fn) => {
+				const b = document.createElement('button');
+				b.textContent = label;
+				b.addEventListener('click', fn);
+				topBar.appendChild(b);
+				return b;
+			};
+			mkTop('Export', () => {
+				const json = BE.settings.exportJSON();
+				navigator.clipboard?.writeText(json).catch(() => {});
+				BE.modules.toast.show('Settings copied to clipboard', 'success');
+			});
+			mkTop('Import', () => {
+				const json = prompt('Paste exported Booru Enhancer settings JSON:');
+				if (!json) return;
+				const ok = BE.settings.importJSON(json);
+				BE.modules.toast.show(ok ? 'Settings imported' : 'Import failed — invalid JSON', ok ? 'success' : 'error');
+				if (ok) { panel.remove(); createSettingsPanel(); }
+			});
+			mkTop('Reset', () => {
+				if (!confirm('Reset all Booru Enhancer settings to defaults?')) return;
+				BE.settings.resetAll();
+				panel.remove();
+				createSettingsPanel();
+				BE.modules.toast.show('Settings reset to defaults', 'success');
+			});
+			mkTop('Close', () => { panel.style.display = 'none'; });
+			panel.appendChild(topBar);
+
+			const categories = BE.settings.categories();
+			for (const cat of categories) {
+				const h = document.createElement('h3');
+				h.textContent = cat;
+				panel.appendChild(h);
+
+				for (const key of BE.settings.byCategory(cat)) {
+					const def = BE.settings.SCHEMA[key];
+					const row = document.createElement('div');
+					row.className = 'be-settings-row';
+
+					const label = document.createElement('label');
+					label.textContent = def.label;
+					row.appendChild(label);
+
+					let input;
+					if (def.type === 'bool') {
+						input = document.createElement('input');
+						input.type = 'checkbox';
+						input.checked = BE.settings.get(key);
+						input.addEventListener('change', () => BE.settings.set(key, input.checked));
+					} else if (def.type === 'select') {
+						input = document.createElement('select');
+						for (const choice of def.choices) {
+							const opt = document.createElement('option');
+							opt.value = choice;
+							opt.textContent = choice;
+							input.appendChild(opt);
+						}
+						input.value = BE.settings.get(key);
+						input.addEventListener('change', () => BE.settings.set(key, input.value));
+					} else if (def.type === 'color') {
+						input = document.createElement('input');
+						input.type = 'color';
+						input.value = BE.settings.get(key);
+						input.addEventListener('input', () => BE.settings.set(key, input.value));
+					} else if (def.type === 'range' || def.type === 'number') {
+						const valSpan = document.createElement('span');
+						valSpan.textContent = ` [${BE.settings.get(key)}]`;
+						valSpan.style.fontWeight = 'bold';
+
+						input = document.createElement('input');
+						input.type = def.type === 'range' ? 'range' : 'number';
+						input.min = def.min;
+						input.max = def.max;
+						input.value = BE.settings.get(key);
+						input.style.width = '90%';
+						input.addEventListener('input', () => {
+							valSpan.textContent = ` [${input.value}]`;
+							BE.settings.set(key, Number(input.value));
+						});
+						row.appendChild(input);
+						row.appendChild(valSpan);
+						panel.appendChild(row);
+						continue;
+					} else if (def.type === 'textarea') {
+						input = document.createElement('textarea');
+						input.value = BE.settings.get(key);
+						input.style.width = '100%';
+						input.style.height = '60px';
+						input.addEventListener('change', () => BE.settings.set(key, input.value));
+					} else {
+						input = document.createElement('input');
+						input.type = 'text';
+						input.value = BE.settings.get(key);
+						input.style.width = '100%';
+						input.addEventListener('change', () => BE.settings.set(key, input.value));
+					}
+					row.appendChild(input);
+					panel.appendChild(row);
+				}
+			}
+
+			document.body.appendChild(panel);
+		}
+
+		function invalidateCurrentPost() { currentPostCache = null; }
+
 		return {
-			scan, initInfiniteScroll, setSelectionMode, toggleSelect, selectedPosts, applyGridSettings,
-			get selectionMode() { return selectionMode; },
-						  get orderedPosts() { return orderedPosts; },
-						  postFor(img) { return thumbToPost.get(img); },
+			injectStyles, createToolbar, removeToolbar, createPostActionBar,
+			createSettingsPanel, getCurrentPost, invalidateCurrentPost,
 		};
 	})();
 
 	/* ============================================================ *
-	 *  KEYBINDS
+	 *  MENU COMMANDS
 	 * ============================================================ */
-	BE.modules.keybinds = (() => {
-		function normalize(k) { return k.length === 1 ? k.toLowerCase() : k; }
-		function eventKey(e) { return normalize(e.key); }
+	BE.modules.menu = (() => {
+		let registered = false;
+		function register() {
+			if (registered) return; // avoid duplicate entries on re-init (SPA nav)
+	registered = true;
+			try {
+				_GM.registerMenuCommand('Booru Enhancer: Settings', () => BE.modules.ui.createSettingsPanel());
+				_GM.registerMenuCommand('Booru Enhancer: Enable/Disable', () => {
+					const cur = BE.settings.get('general.enabled');
+					BE.settings.set('general.enabled', !cur);
+					BE.modules.toast.show(`Booru Enhancer ${!cur ? 'enabled' : 'disabled'} — reload the page to apply`, 'info', 4000);
+				});
+				_GM.registerMenuCommand('Booru Enhancer: Reset Settings', () => {
+					if (confirm('Reset all Booru Enhancer settings to defaults?')) {
+						BE.settings.resetAll();
+						BE.modules.toast.show('Settings reset', 'success');
+					}
+				});
+				_GM.registerMenuCommand('Booru Enhancer: Toggle Debug Mode', () => {
+					const cur = BE.settings.get('debug.verboseLogging');
+					BE.settings.set('debug.verboseLogging', !cur);
+					BE.modules.toast.show(`Debug mode ${!cur ? 'ON' : 'OFF'}`, 'info');
+				});
+			} catch (err) {
+				// Some managers (or contexts without menu support) may not have
+				// GM_registerMenuCommand available at all — this must not be fatal.
+				BE.log.warn('[Menu] registerMenuCommand unavailable', err);
+			}
+		}
+		return { register };
+	})();
 
-		function handler(e) {
-			const tag = document.activeElement?.tagName;
-			if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+	/* ============================================================ *
+	 *  INITIALIZATION  (resilient bootstrap)
+	 * ============================================================ *
+	 *  Every stage is wrapped so that one broken module can never
+	 *  take down the rest of the script, and every failure/skip is
+	 *  logged with a reason instead of a silent `return`.
+	 * ============================================================ */
+	let _beInitialized = false;
 
-			const key = eventKey(e);
-			const noContext = () => BE.modules.ui.toast('Open a post or select a thumbnail first.');
-			const binds = {
-				[BE.settings.get('keys.close')]: () => BE.modules.viewer.isOpen() && BE.modules.viewer.close(),
-						   [BE.settings.get('keys.next')]: () => BE.modules.viewer.isOpen() && BE.modules.viewer.go(1),
-						   [BE.settings.get('keys.prev')]: () => BE.modules.viewer.isOpen() && BE.modules.viewer.go(-1),
-						   [BE.settings.get('keys.playPause')]: () => { if (BE.modules.viewer.isOpen()) { e.preventDefault(); BE.modules.viewer.togglePlayPause(); } },
-						   [BE.settings.get('keys.download')]: () => currentContextPost() ? BE.modules.downloader.downloadPost(currentContextPost()) : noContext(),
-						   [BE.settings.get('keys.favorite')]: () => currentContextPost() ? BE.modules.favorites.favoritePost(currentContextPost()) : noContext(),
-						   [BE.settings.get('keys.openOriginal')]: () => currentContextPost() ? window.open(currentContextPost().originalUrl, '_blank', 'noopener') : noContext(),
-						   [BE.settings.get('keys.viewOriginal')]: () => toggleViewerFromContext(),
-			};
+	function safeStage(name, fn) {
+		try {
+			fn();
+			BE.log.info(`[Init] ${name}: ok`);
+			return true;
+		} catch (err) {
+			BE.log.error(`[Init] ${name}: FAILED`, err);
+			return false;
+		}
+	}
 
-			if (e.ctrlKey && key === BE.settings.get('keys.commandPalette')) {
-				e.preventDefault();
-				BE.bus.emit('ui:command-palette-toggle', {});
+	BE.modules.init = function init() {
+		// Idempotent: calling BE.init()/BE.modules.init() twice (e.g. after an
+		// SPA navigation) must never create duplicate toolbars/listeners.
+		if (_beInitialized) {
+			BE.log.debug('[Init] already initialized, re-applying page-specific UI only');
+			refreshForCurrentPage();
+			return;
+		}
+		_beInitialized = true;
+
+		BE.log.info('[Init] Starting...');
+		BE.log.info(`[Init] Host: ${location.hostname}`);
+
+		BE.store.whenReady(() => {
+			let settingsOk = safeStage('Settings', () => BE.settings._load());
+			if (!settingsOk) {
+				BE.log.warn('[Init] Settings failed to load — continuing with schema defaults.');
+			}
+			BE.log.info('[Init] Settings loaded');
+
+			let adapter = null;
+			const adapterOk = safeStage('Adapter detection', () => {
+				adapter = BE.core.detectAdapter();
+			});
+			if (!adapterOk || !adapter) {
+				BE.log.error('[Init] Adapter detection failed: falling back to generic adapter.');
+				adapter = BE.adapters.registry.find((a) => a.id === 'generic') || null;
+			}
+			BE.adapters.active = adapter;
+			BE.log.info(`[Init] Adapter: ${adapter ? adapter.id : 'NONE'}`);
+
+			if (!adapter) {
+				BE.log.error('[Init] FATAL: no adapter available (not even generic). Booru Enhancer cannot run on this page.');
 				return;
 			}
-			const fn = binds[key];
-			if (fn) fn();
-		}
 
-		function currentContextPost() {
-			if (BE.modules.viewer.isOpen()) return BE.modules.viewer.currentPost;
-			return BE.core.currentPost || null;
-		}
-
-		function toggleViewerFromContext() {
-			if (BE.modules.viewer.isOpen()) { BE.modules.viewer.close(); return; }
-			if (BE.core.currentPost) { BE.modules.viewer.open([BE.core.currentPost], 0); return; }
-			BE.modules.ui.toast('Open a post or select a thumbnail first.');
-		}
-
-		function init() { window.addEventListener('keydown', handler); }
-		return { init };
-	})();
-
-	/* ============================================================ *
-	 *  UI
-	 * ============================================================ */
-	BE.modules.ui = (() => {
-		let toolbar;
-		let toastHost;
-		const RELOAD_REQUIRED_KEYS = new Set([
-			'general.enabled', 'general.toolbarPosition', 'media.mode', 'gallery.infiniteScroll',
-		]);
-
-		function toast(message, ms = 3200) {
-			if (!toastHost) {
-				toastHost = BE.dom.create('div', { class: 'be-toast-host' });
-				document.body.appendChild(toastHost);
+			// general.enabled may be undefined/corrupt in storage — treat
+			// anything except an explicit `false` as enabled.
+			const enabled = BE.settings.get('general.enabled') !== false;
+			if (!enabled) {
+				BE.log.info('[Init] Booru Enhancer is disabled in settings for this site. Registering menu command only.');
+				safeStage('Menu commands', () => BE.modules.menu.register());
+				return;
 			}
-			const el = BE.dom.create('div', { class: 'be-toast', text: message });
-			toastHost.appendChild(el);
-			requestAnimationFrame(() => el.classList.add('be-toast-in'));
-			setTimeout(() => {
-				el.classList.remove('be-toast-in');
-				setTimeout(() => el.remove(), 220);
-			}, ms);
-		}
 
-		function buildToolbar() {
-			toolbar = BE.dom.create('div', { class: `be-toolbar be-toolbar-${BE.settings.get('general.toolbarPosition')}` }, [
-				toolbarBtn('⚙', 'Settings', () => BE.modules.settingsPanel.open()),
-									toolbarBtn('☰', 'Select posts', () => {
-										const on = !document.documentElement.classList.contains('be-selection-mode');
-										BE.modules.gallery.setSelectionMode(on);
-										toast(on ? 'Selection mode on — click thumbnails to select them.' : 'Selection mode off.');
-									}),
-						   toolbarBtn('⬇', 'Bulk download selected', () => {
-							   BE.modules.downloader.bulkDownload(BE.modules.gallery.selectedPosts());
-						   }),
-						   toolbarBtn('🔍', 'Reverse search current', () => {
-							   const selectedOnes = BE.modules.gallery.selectedPosts();
-							   const post = BE.core.currentPost || (selectedOnes.length === 1 ? selectedOnes[0] : null);
-							   BE.modules.reverseSearch.open('saucenao', post?.originalUrl);
-						   }),
-			]);
-			document.body.appendChild(toolbar);
-		}
-		function toolbarBtn(icon, title, onClick) {
-			return BE.dom.create('button', { class: 'be-toolbar-btn', title, text: icon, onclick: onClick });
-		}
+			// 1. IMMEDIATE UI INIT — must appear regardless of storage/API state.
+			safeStage('UI styles', () => BE.modules.ui.injectStyles());
+			safeStage('Toolbar', () => BE.modules.ui.createToolbar());
+			safeStage('Post action bar', () => BE.modules.ui.createPostActionBar());
+			safeStage('Menu commands', () => BE.modules.menu.register());
+			BE.log.info('[Init] UI initialized');
 
-		function init() {
-			buildToolbar();
-			applyTheme();
-			BE.bus.on('settings:changed', ({ key }) => {
-				if (key === 'general.theme' || key === 'general.accentColor') applyTheme();
-				if (key === 'gallery.gridDensity' || key === 'gallery.compactMode') BE.modules.gallery.applyGridSettings();
-				if (key === 'media.thumbQuality') {
-					BE.dom.qsa('img[data-be-enriched="done"]').forEach((img) => {
-						const post = BE.modules.gallery.postFor(img);
-						if (post) BE.modules.mediaLoader.applyThumbQuality(img, post);
-					});
-				}
+			// 2. IMMEDIATE GALLERY BINDING & LAYOUT
+			let container = null;
+			safeStage('Gallery init', () => {
+				container = adapter.getGalleryContainer();
+				if (container) BE.modules.gallery.init(container);
 			});
-		}
+				BE.log.info(`[Init] Gallery initialized (container: ${container ? 'found' : 'none on this page'})`);
 
-		function applyTheme() {
-			document.documentElement.style.setProperty('--be-accent', BE.settings.get('general.accentColor'));
-			document.documentElement.dataset.beTheme = BE.settings.get('general.theme');
-		}
+				// 3. ASYNC METADATA ENRICHMENT — never blocks the UI above.
+				setTimeout(() => safeStage('Metadata enrichment', () => BE.modules.gallery.enrichThumbnails()), 0);
 
-		return { init, toast, RELOAD_REQUIRED_KEYS, get toolbar() { return toolbar; } };
-	})();
-
-	BE.modules.settingsPanel = (() => {
-		let overlay;
-
-		function fieldControl(key, def) {
-			const val = BE.settings.get(key);
-			const onChange = (v) => BE.settings.set(key, v);
-			switch (def.type) {
-				case 'bool':
-					return BE.dom.create('input', { type: 'checkbox', checked: val ? 'checked' : null, onchange: (e) => onChange(e.target.checked) });
-				case 'select':
-					return BE.dom.create('select', { onchange: (e) => onChange(e.target.value) },
-										 def.choices.map((c) => BE.dom.create('option', { value: c, selected: c === val ? 'selected' : null, text: c })));
-				case 'color':
-					return BE.dom.create('input', { type: 'color', value: val, onchange: (e) => onChange(e.target.value) });
-				case 'range':
-					return BE.dom.create('input', { type: 'range', min: def.min, max: def.max, value: val, oninput: (e) => onChange(Number(e.target.value)) });
-				case 'number':
-					return BE.dom.create('input', { type: 'number', min: def.min, max: def.max, value: val, onchange: (e) => onChange(Number(e.target.value)) });
-				case 'textarea':
-					return BE.dom.create('textarea', { rows: 4, onchange: (e) => onChange(e.target.value) }, [val]);
-				default:
-					return BE.dom.create('input', { type: 'text', value: val, onchange: (e) => onChange(e.target.value) });
-			}
-		}
-
-		function buildContent(filterText = '') {
-			const content = BE.dom.create('div', { class: 'be-settings-content' });
-			const cats = BE.settings.categories();
-			for (const cat of cats) {
-				const keys = BE.settings.byCategory(cat).filter((k) => {
-					if (!filterText) return true;
-					const def = BE.settings.SCHEMA[k];
-					return def.label.toLowerCase().includes(filterText) || k.toLowerCase().includes(filterText);
-				});
-				if (!keys.length) continue;
-				const section = BE.dom.create('div', { class: 'be-settings-section' }, [
-					BE.dom.create('h3', { text: cat }),
-				]);
-				for (const key of keys) {
-					const def = BE.settings.SCHEMA[key];
-					const needsReload = BE.modules.ui.RELOAD_REQUIRED_KEYS.has(key);
-					const row = BE.dom.create('div', { class: 'be-settings-row' }, [
-						BE.dom.create('label', {}, [def.label, needsReload ? BE.dom.create('span', { class: 'be-reload-badge', text: 'Reload required' }) : null]),
-											  fieldControl(key, def),
-					]);
-					section.appendChild(row);
+				// 4. ASYNC INFINITE SCROLL — set up as soon as the gallery exists,
+				// no arbitrary fixed delay beyond letting the container settle.
+				if (BE.settings.get('gallery.infiniteScroll') && container) {
+					safeStage('Infinite scroll', () => BE.modules.gallery.setupInfiniteScroll());
 				}
-				content.appendChild(section);
-			}
-			return content;
-		}
 
-		function rebuild(filterText) {
-			const content = BE.dom.qs('.be-settings-content', overlay);
-			content.replaceWith(buildContent(filterText));
-		}
-
-		function open() {
-			if (!overlay) {
-				const search = BE.dom.create('input', {
-					type: 'text', placeholder: 'Search settings…', class: 'be-settings-search',
-					oninput: BE.dom.debounce((e) => rebuild(e.target.value.toLowerCase()), 120),
-				});
-				overlay = BE.dom.create('div', { class: 'be-settings-overlay be-hidden' }, [
-					BE.dom.create('div', { class: 'be-settings-modal' }, [
-						BE.dom.create('div', { class: 'be-settings-header' }, [
-							BE.dom.create('h2', { text: `Booru Enhancer — Settings (v${BE.VERSION})` }),
-									  search,
-					BE.dom.create('button', { class: 'be-settings-close', text: '✕', onclick: close }),
-						]),
-				   buildContent(),
-								  BE.dom.create('div', { class: 'be-settings-footer' }, [
-									  BE.dom.create('button', { text: 'Export JSON', onclick: exportSettings }),
-												BE.dom.create('button', { text: 'Import JSON', onclick: importSettings }),
-												BE.dom.create('button', { text: 'Reset all to defaults', class: 'be-danger', onclick: () => { if (confirm('Reset ALL settings to defaults?')) { BE.settings.resetAll(); rebuild(''); } } }),
-								  ]),
-					]),
-				]);
-				overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-				document.body.appendChild(overlay);
-			}
-			overlay.classList.remove('be-hidden');
-		}
-		function close() { overlay?.classList.add('be-hidden'); }
-
-		function exportSettings() {
-			const blob = new Blob([BE.settings.exportJSON()], { type: 'application/json' });
-			const a = BE.dom.create('a', { href: URL.createObjectURL(blob), download: 'booru-enhancer-settings.json' });
-			document.body.appendChild(a); a.click(); a.remove();
-		}
-		function importSettings() {
-			const input = BE.dom.create('input', { type: 'file', accept: 'application/json' });
-			input.addEventListener('change', () => {
-				const file = input.files[0];
-				if (!file) return;
-				const reader = new FileReader();
-				reader.onload = () => { if (BE.settings.importJSON(reader.result)) rebuild(''); };
-				reader.readAsText(file);
-			});
-			input.click();
-		}
-
-		return { open, close };
-	})();
-
-	/* ============================================================ *
-	 *  STYLES  (includes new v1.1.1 pagination-related styles)
-	 * ============================================================ */
-	_GM.addStyle(`
-	:root {
-		--be-accent: #ff8ac6;
-		--be-bg: #16161c;
-		--be-bg-elevated: #202028;
-		--be-fg: #eaeaf0;
-		--be-fg-dim: #9a9aa8;
-		--be-radius: 10px;
-		--be-shadow: 0 8px 30px rgba(0,0,0,.45);
-		--be-grid-columns: 6;
-		--be-thumb-gap: 10px;
-	}
-	[data-be-theme="light"] {
-		--be-bg: #f4f4f8; --be-bg-elevated: #ffffff; --be-fg: #1b1b22; --be-fg-dim: #666676;
-	}
-	.be-hidden { display: none !important; }
-
-	/* Reversible pagination hiding — replaced style.display = 'none'
-	 *      so disabling infinite scroll restores native pagination. */
-	.be-pagination-hidden { display: none !important; }
-
-	/* Gallery grid */
-	.be-gallery-grid {
-		display: grid !important;
-		grid-template-columns: repeat(var(--be-grid-columns), 1fr) !important;
-		gap: var(--be-thumb-gap) !important;
-	}
-	.be-gallery-grid.be-gallery-compact { --be-thumb-gap: 4px; }
-	.be-gallery-grid .be-thumb-wrap {
-		width: 100% !important; height: auto !important; margin: 0 !important;
-		aspect-ratio: 1 / 1; overflow: hidden; border-radius: 6px;
-	}
-	img.be-thumb-img {
-		width: 100% !important; height: 100% !important; max-width: none !important; max-height: none !important;
-		object-fit: cover; display: block;
-	}
-
-	/* Toolbar */
-	.be-toolbar { position: fixed; z-index: 999997; display: flex; gap: 6px; padding: 6px;
-		background: var(--be-bg-elevated); border-radius: var(--be-radius); box-shadow: var(--be-shadow); }
-		.be-toolbar-bottom-right { right: 16px; bottom: 16px; }
-		.be-toolbar-bottom-left { left: 16px; bottom: 16px; }
-		.be-toolbar-top-right { right: 16px; top: 16px; }
-		.be-toolbar-top-left { left: 16px; top: 16px; }
-		.be-toolbar-btn { width: 38px; height: 38px; border-radius: 8px; border: none; cursor: pointer;
-			background: transparent; color: var(--be-fg); font-size: 16px; transition: background .15s; }
-			.be-toolbar-btn:hover { background: var(--be-accent); color: #111; }
-
-			/* Toast notifications */
-			.be-toast-host { position: fixed; z-index: 9999999; left: 50%; bottom: 76px; transform: translateX(-50%);
-				display: flex; flex-direction: column; gap: 6px; align-items: center; pointer-events: none; }
-				.be-toast { background: rgba(20,20,26,.94); color: #fff; padding: 9px 16px; border-radius: 8px;
-					font-size: 13px; box-shadow: var(--be-shadow); opacity: 0; transform: translateY(8px);
-					transition: opacity .18s ease, transform .18s ease; max-width: 60vw; text-align: center; }
-					.be-toast-in { opacity: 1; transform: translateY(0); }
-
-					/* Thumbnail overlay */
-					.be-thumb-wrap { position: relative; }
-					.be-thumb-overlay { position: absolute; top: 4px; right: 4px; display: flex; gap: 4px; opacity: 0;
-						transition: opacity .12s; z-index: 5; }
-						.be-thumb-wrap:hover .be-thumb-overlay { opacity: 1; }
-						.be-thumb-fav, .be-thumb-dl { width: 26px; height: 26px; border-radius: 50%; border: none; cursor: pointer;
-							background: rgba(0,0,0,.65); color: #fff; font-size: 13px; line-height: 26px; padding: 0; }
-							.be-thumb-fav.be-active { background: var(--be-accent); color: #111; }
-							.be-thumb-badge { position: absolute; left: 4px; bottom: 4px; background: rgba(0,0,0,.7); color: #fff;
-								font-size: 10px; padding: 2px 5px; border-radius: 4px; letter-spacing: .04em; }
-								.be-filtered-hidden { display: none !important; }
-								.be-selection-mode .be-thumb-wrap { outline: 2px dashed transparent; cursor: pointer; }
-								.be-selected { outline: 2px solid var(--be-accent) !important; }
-
-								/* Hover preview */
-								.be-hover-preview { position: fixed; z-index: 999996; max-width: 320px; max-height: 420px;
-									border-radius: var(--be-radius); overflow: hidden; box-shadow: var(--be-shadow); pointer-events: none; }
-									.be-hover-preview img { display: block; width: 100%; height: auto; }
-
-									/* Infinite scroll sentinel — v1.1.1 with retry button support */
-									.be-scroll-sentinel {
-										width: 100%; text-align: center; padding: 24px; color: var(--be-fg-dim);
-										grid-column: 1/-1; display: flex; align-items: center; justify-content: center; gap: 10px;
-										font-size: 14px; min-height: 24px;
-									}
-									.be-sentinel-text { color: var(--be-fg-dim); }
-									.be-sentinel-retry {
-										padding: 5px 16px; border-radius: 6px; border: 1px solid var(--be-accent);
-										background: transparent; color: var(--be-accent); cursor: pointer; font-size: 13px;
-										transition: background .15s, color .15s;
-									}
-									.be-sentinel-retry:hover { background: var(--be-accent); color: #111; }
-
-									/* Viewer */
-									.be-viewer { position: fixed; inset: 0; z-index: 999999; background: rgba(6,6,10,.97);
-										display: flex; flex-direction: column; }
-										html.be-viewer-open { overflow: hidden; }
-										.be-viewer-toolbar { display: flex; align-items: center; gap: 4px; padding: 8px 12px;
-											background: rgba(0,0,0,.4); }
-											.be-v-btn { width: 36px; height: 36px; border-radius: 8px; border: none; background: transparent;
-												color: #eee; font-size: 16px; cursor: pointer; }
-												.be-v-btn:hover { background: var(--be-accent); color: #111; }
-												.be-v-counter { margin-left: auto; color: #ccc; font-variant-numeric: tabular-nums; padding-right: 8px; }
-												.be-viewer-media { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden;
-													position: relative; cursor: grab; }
-													.be-viewer-media img, .be-viewer-media video { transition: transform .05s linear; user-select: none; }
-													.be-viewer-fit-fit-both { max-width: 96vw; max-height: 82vh; }
-													.be-viewer-fit-fit-width { width: 96vw; height: auto; }
-													.be-viewer-fit-fit-height { height: 82vh; width: auto; }
-													.be-viewer-fit-original-size { max-width: none; max-height: none; }
-													.be-viewer-info-panel { position: absolute; right: 16px; top: 60px; background: rgba(20,20,26,.92);
-														border-radius: var(--be-radius); padding: 12px 16px; box-shadow: var(--be-shadow); }
-														.be-info-table td { padding: 3px 10px 3px 0; font-size: 13px; color: #ddd; }
-														.be-info-key { color: var(--be-fg-dim); }
-
-														/* Tags */
-														.be-tag-colored { color: var(--be-tag-color) !important; }
-														.be-tag-collapsed { display: none !important; }
-														.be-tag-expand-btn { display: block; margin-top: 6px; background: none; border: none;
-															color: var(--be-accent); cursor: pointer; font-size: 12px; }
-
-															/* Settings panel */
-															.be-settings-overlay { position: fixed; inset: 0; z-index: 999998; background: rgba(0,0,0,.6);
-																display: flex; align-items: center; justify-content: center; }
-																.be-settings-modal { width: min(760px, 92vw); max-height: 84vh; display: flex; flex-direction: column;
-																	background: var(--be-bg); color: var(--be-fg); border-radius: var(--be-radius); box-shadow: var(--be-shadow); overflow: hidden; }
-																	.be-settings-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px;
-																		background: var(--be-bg-elevated); }
-																		.be-settings-header h2 { font-size: 15px; margin: 0; white-space: nowrap; }
-																		.be-settings-search { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #3a3a46;
-																			background: var(--be-bg); color: var(--be-fg); }
-																			.be-settings-close { background: none; border: none; color: var(--be-fg); font-size: 16px; cursor: pointer; }
-																			.be-settings-content { flex: 1; overflow-y: auto; padding: 8px 16px; }
-																			.be-settings-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
-																				color: var(--be-accent); margin: 16px 0 6px; }
-																				.be-settings-row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
-																					padding: 6px 0; border-bottom: 1px solid rgba(128,128,128,.12); }
-																					.be-settings-row label { font-size: 13px; color: var(--be-fg); flex: 1; display: flex; align-items: center; gap: 8px; }
-																					.be-reload-badge { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: #ffb454;
-																						border: 1px solid rgba(255,180,84,.5); border-radius: 4px; padding: 1px 5px; white-space: nowrap; }
-																						.be-settings-row input[type="text"], .be-settings-row textarea, .be-settings-row select, .be-settings-row input[type="number"] {
-																							background: var(--be-bg-elevated); color: var(--be-fg); border: 1px solid #3a3a46; border-radius: 6px; padding: 4px 8px; min-width: 160px; }
-																							.be-settings-footer { display: flex; gap: 8px; padding: 12px 16px; background: var(--be-bg-elevated); }
-																							.be-settings-footer button { padding: 7px 12px; border-radius: 6px; border: none; cursor: pointer;
-																								background: var(--be-accent); color: #111; font-weight: 600; }
-																								.be-settings-footer button.be-danger { background: #c0392b; color: #fff; }
-																								`);
-
-	/* ============================================================ *
-	 *  BOOTSTRAP
-	 * ============================================================ */
-	BE.core.currentPost = null;
-
-	async function initCurrentPostPage(adapter) {
-		if (!adapter.isPostPage()) return;
-		const id = adapter.getPostId();
-		if (!id) return;
-		try {
-			const post = await adapter.fetchPost(id);
-			if (!post) return;
-			BE.core.currentPost = post;
-			BE.bus.emit('post:loaded', post);
-			BE.modules.mediaLoader.onPostPage(post);
-			decoratePostPage(post, adapter);
-		} catch (err) {
-			BE.log.error('failed to load post metadata', err);
-			BE.modules.ui.toast('Could not load full post metadata — some features (tags, info panel) may be limited on this page.');
-		}
-	}
-
-	function decoratePostPage(post, adapter) {
-		if (BE.settings.get('tags.colorize')) {
-			const categoryMap = {
-				artist: post.artists, character: post.characters, copyright: post.copyrights,
- general: post.generalTags, meta: post.metaTags,
-			};
-			for (const [cat, tags] of Object.entries(categoryMap)) {
-				const set = new Set(tags);
-				BE.dom.qsa('a[href*="tags="], .tag-link, li[class*="tag-type-"] a, li[class*="category-"] a').forEach((a) => {
-					const t = (a.textContent || '').trim().replace(/\s+/g, '_').toLowerCase();
-					if (set.has(t)) BE.modules.tagTools.colorizeCategory(a.closest('li') || a, cat);
-				});
-			}
-		}
-		const tagList = BE.dom.qs('#tag-list, ul#tag-sidebar, .tag-list');
-		if (tagList) BE.modules.tagTools.buildCollapsible(tagList, BE.settings.get('tags.collapseThreshold'));
-
-		const dock = BE.dom.create('div', { class: 'be-post-dock' });
-		const infoToggle = BE.dom.create('button', { class: 'be-toolbar-btn', text: 'ℹ', title: 'Image info', onclick: () => {
-			panel.classList.toggle('be-hidden');
-		} });
-		const panel = BE.dom.create('div', { class: 'be-hidden' }, [BE.modules.imageInfo.render(post)]);
-		const reverseBtns = Object.keys(BE.modules.reverseSearch.ENGINES).map((engine) =>
-		BE.dom.create('button', { class: 'be-toolbar-btn', text: engine[0].toUpperCase(), title: `Reverse search: ${engine}`, onclick: () => BE.modules.reverseSearch.open(engine, post.originalUrl) }));
-		dock.append(infoToggle, ...reverseBtns, panel);
-
-		if (post.source) {
-			const platform = BE.modules.sourceLinks.detect(post.source);
-			const srcRow = BE.dom.create('div', {}, [
-				BE.dom.create('a', { href: post.source, target: '_blank', rel: 'noopener', text: `${platform ? platform.icon + ' ' : ''}Source` }),
-			]);
-			dock.appendChild(srcRow);
-		}
-		const insertTarget = BE.dom.qs(adapter.gridContainerSelector) || document.body;
-		(BE.dom.qs('#image, #main_image')?.closest('div') || insertTarget).appendChild(dock);
-	}
-
-	function initGalleryPage(adapter) {
-		BE.modules.gallery.scan();
-		BE.modules.gallery.initInfiniteScroll();
-		const observer = new MutationObserver(BE.dom.debounce(() => BE.modules.gallery.scan(), 200));
-		const container = BE.dom.qs(adapter.gridContainerSelector) || document.body;
-		observer.observe(container, { childList: true, subtree: true });
-	}
-
-	function init() {
-		if (!BE.settings.get('general.enabled')) { BE.log.info('disabled for this site, skipping init'); return; }
-
-		BE.adapters.active = BE.core.detectAdapter();
-		BE.log.info(`v${BE.VERSION} initializing with adapter "${BE.adapters.active.id}" on ${location.hostname}`);
-
-		BE.modules.ui.init();
-		BE.modules.keybinds.init();
-
-		initCurrentPostPage(BE.adapters.active);
-		initGalleryPage(BE.adapters.active);
-
-		_GM.registerMenuCommand('Booru Enhancer: Settings', () => BE.modules.settingsPanel.open());
-		_GM.registerMenuCommand('Booru Enhancer: Toggle enabled', () => {
-			BE.settings.set('general.enabled', !BE.settings.get('general.enabled'));
-			location.reload();
+				// 5. Viewer/hover/favorites are lazily initialized on first use,
+				// so a failure there can never block startup.
 		});
+	};
 
-		BE.bus.emit('core:ready', {});
+	function refreshForCurrentPage() {
+		safeStage('Toolbar refresh', () => BE.modules.ui.createToolbar());
+		safeStage('Post action bar refresh', () => BE.modules.ui.createPostActionBar());
+		BE.modules.ui.invalidateCurrentPost();
 	}
 
-	const STORE_SCHEMA_VERSION = 1;
-	BE.store.whenReady(() => {
-		const storedVersion = BE.store.get('__schemaVersion', 0);
-		if (storedVersion < STORE_SCHEMA_VERSION) {
-			BE.store.set('__schemaVersion', STORE_SCHEMA_VERSION);
+	/* ============================================================ *
+	 *  SPA / AJAX NAVIGATION HANDLING
+	 * ============================================================ *
+	 *  Sites like Danbooru/e621 can swap content via pushState/AJAX
+	 *  without a full reload. Re-detect state and refresh page-scoped
+	 *  UI (toolbar buttons, post action bar) without re-creating
+	 *  duplicate global UI (toolbar root/listeners are idempotent).
+	 * ============================================================ */
+	(function watchSpaNavigation() {
+		let lastUrl = location.href;
+		const onUrlChange = BE.dom.debounce(() => {
+			if (location.href === lastUrl) return;
+			lastUrl = location.href;
+			BE.log.debug('[Nav] URL changed, refreshing page-scoped UI');
+			safeStage('Adapter re-detect', () => { BE.adapters.active = BE.core.detectAdapter() || BE.adapters.active; });
+			refreshForCurrentPage();
+		}, 150);
+
+		for (const fnName of ['pushState', 'replaceState']) {
+			const orig = history[fnName];
+			history[fnName] = function patched(...args) {
+				const ret = orig.apply(this, args);
+				onUrlChange();
+				return ret;
+			};
 		}
-		BE.settings._load();
-		BE.dom.ready(init);
-	});
+		window.addEventListener('popstate', onUrlChange);
+
+		// Fallback for sites that replace DOM content without touching the
+		// URL/history API at all. We only re-initialize when the container
+		// found by the adapter is genuinely a DIFFERENT element than the one
+		// the gallery module already owns — that distinguishes a true SPA
+		// content swap from unrelated mutations inside the same gallery,
+		// which must never reset pagination/loadedPostIds state.
+		const bodyObserver = new MutationObserver(BE.dom.debounce(() => {
+			if (!BE.adapters.active) return;
+			const container = BE.adapters.active.getGalleryContainer();
+			if (container && !container.dataset.beGalleryInit) {
+				BE.log.debug('[Nav] gallery container replaced, re-initializing gallery module');
+				safeStage('Gallery re-init', () => {
+					BE.modules.gallery.init(container);
+					if (BE.settings.get('gallery.infiniteScroll')) {
+						BE.modules.gallery.setupInfiniteScroll();
+					}
+					setTimeout(() => safeStage('Metadata enrichment (re-init)', () => BE.modules.gallery.enrichThumbnails()), 0);
+				});
+			}
+		}, 400));
+		BE.dom.ready(() => bodyObserver.observe(document.body, { childList: true, subtree: true }));
+	})();
+
+	BE.dom.ready(BE.modules.init);
+
+	// Public, idempotent entry point mentioned in the architecture spec —
+	// calling this more than once must never duplicate UI/listeners.
+	BE.init = BE.modules.init;
 })();
