@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Booru Enhancer
 // @namespace    https://sleazyfork.org/en/scripts/587810-booru-enhancer
-// @version      1.2.5
+// @version      1.2.7
 // @description  Modular enhancement suite for Danbooru/Gelbooru/Moebooru-family booru sites — original-quality media, smart downloads, fullscreen viewer, tag tools, blacklist filtering, infinite scroll, reverse image search, and more.
 // @author       itachi-re
 // @license      MIT
@@ -61,33 +61,66 @@
 
 /**
  * =============================================================================
- *  BOORU ENHANCER  —  v1.2.5
+ *  BOORU ENHANCER  —  v1.2.7
  * =============================================================================
- *  CHANGELOG (1.1.2 → 1.2.5)
- *  --------------------------
- *  - Fixed a bug where a fallback pagination URL was calculated but never
- *    actually used to fetch the next page.
- *  - loadedPostIds is now seeded from the initial gallery before any
- *    infinite-scroll request goes out, and reset only on genuine gallery
- *    replacement (SPA navigation), not on unrelated DOM mutations.
- *  - Generic-site pagination no longer assumes a fixed "+42" page size; it
- *    prefers explicit next-page links, then an observed page-size delta,
- *    and otherwise safely reports "no next page" instead of guessing.
- *  - Infinite scroll no longer hides the site's native paginator until a
- *    page has actually been loaded successfully; failures restore it.
- *  - setupInfiniteScroll() and gallery init() are now fully idempotent:
- *    repeated calls (SPA nav, MutationObserver, settings changes) can no
- *    longer create duplicate sentinels, observers, or event listeners.
- *  - Added pagination-identity tracking to detect and stop A→B→A style or
- *    same-URL infinite-scroll loops, and to stop looping when a page
- *    returns only already-seen posts with no valid next page.
- *  - Gallery-container replacement (real SPA navigation) now correctly
- *    disconnects old observers/listeners and resets only page-scoped
- *    state, while incidental DOM mutations no longer reset anything.
- *  - Toggling gallery.infiniteScroll on/off repeatedly no longer creates
- *    duplicate observers/sentinels.
- *  - Expanded debug logging around initialization, seeding, pagination
- *    identity, and loop detection.
+ *  CHANGELOG (1.2.6 → 1.2.7) — regression-review follow-up
+ *  ------------------------------------------------------------------------
+ *  - Gallery click/hover delegation moved from capture phase to bubble
+ *    phase. preventDefault() still stops the default navigation either
+ *    way (the browser only commits it after the full capture+bubble
+ *    dispatch completes), but bubble phase no longer runs our logic
+ *    ahead of any click handlers the site itself has on the thumbnail.
+ *  - Gelbooru-family wrapper resolution is now validated, not just
+ *    pattern-matched: a candidate wrapper is only accepted if it contains
+ *    exactly one thumbnail image and resolves to the SAME post ID as the
+ *    image itself. This specifically tightens the generic
+ *    [data-id]/[data-post-id] fallback (used by some Gelbooru-family
+ *    mirrors with non-standard markup), which was broad enough to
+ *    potentially match a multi-post container.
+ *  - Removed the hard-coded "+42" Gelbooru pagination fallback.
+ *    calculateNextUrl() now only extrapolates a next page from a
+ *    genuinely observed page-size delta; with no observation yet it
+ *    reports "no next page" so native pagination is used instead of a
+ *    fabricated URL — this was contradicting the "no fabricated
+ *    pagination" pagination-safety fix from 1.2.5/1.2.6.
+ *
+ *  CHANGELOG (1.2.5 → 1.2.6) — Gelbooru-family interaction/settings fixes
+ *  ------------------------------------------------------------------------
+ *  - Root cause fix: thumbnail "wrapper" detection no longer uses a broad
+ *    img.closest('article, span, div, a'). Every adapter now provides an
+ *    explicit getThumbWrapper(img), so exactly one element per post is
+ *    tagged .be-thumb-wrap — never an unrelated ancestor, and never the
+ *    gallery container itself.
+ *  - This one fix is what was silently breaking the viewer, hover preview,
+ *    favorite/download actions, and grid sizing together: click/hover
+ *    delegation used to fall back to a broad selector list that could
+ *    match the gallery container as "the thumbnail", and .be-thumb-wrap
+ *    could land on the wrong DOM node so grid sizing CSS never reached
+ *    the actual grid item.
+ *  - Click/hover delegation now only ever recognizes '.be-thumb-wrap' —
+ *    no more matching arbitrary article/span/div/a ancestors.
+ *  - Hover preview no longer flickers: pointerout is checked against
+ *    relatedTarget so it only fires once the pointer truly leaves the
+ *    thumbnail, not on every internal child boundary crossing.
+ *  - gallery.thumbnailSize, gallery.gridDensity, and gallery.gridGap now
+ *    visibly affect the grid immediately, because the wrapper receiving
+ *    the sizing CSS is the actual grid item; site-native float/width on
+ *    that element is neutralized so our grid governs layout.
+ *  - gallery.compactMode now has a real, visible effect (denser square
+ *    thumbnails, smaller action buttons) instead of only toggling a class
+ *    with no CSS consumer.
+ *  - --be-thumbnail-size is now actually set as a CSS custom property
+ *    (previously computed in JS but never written to the DOM).
+ *  - The viewer/action-button click path now only ever depends on
+ *    '.be-thumb-wrap' + the post ID, never on metadata enrichment — so it
+ *    keeps working immediately even if the API/HTML enrichment fails.
+ *  - Thumbnails inserted by infinite scroll now go through the same
+ *    wrapper-detection + action-bar-building path as initial thumbnails
+ *    (a cloned node carries no live JS listeners, so the per-thumbnail
+ *    hover action bar is rebuilt explicitly rather than assumed to work).
+ *  - Preserved the 1.2.5 pagination-safety fixes (idempotent init/setup,
+ *    loop detection, native paginator restoration) and the no-overlap
+ *    grid fix (min-width/min-height/overflow/aspect-ratio/object-fit).
  * =============================================================================
  */
 (function booruEnhancer() {
@@ -98,7 +131,7 @@
 	window.__BOORU_ENHANCER_LOADED__ = true;
 
 	const BE = (window.BE = window.BE || {});
-	BE.VERSION = '1.2.5';
+	BE.VERSION = '1.2.7';
 
 	/* ============================================================ *
 	 *  EVENT BUS
@@ -537,6 +570,11 @@
 								const href = art?.getAttribute?.('href') || img.closest('a')?.getAttribute('href') || '';
 								return (href.match(/\/posts\/(\d+)/) || [])[1] || null;
 							},
+							// Requirement 3: the actual post card, not a generic
+							// "closest article/span/div/a" — that would grab the
+							// inner <a> (or worse) instead of the real per-post
+							// container that CSS grid sizing needs to land on.
+							getThumbWrapper: (img) => img.closest('article[id^="post_"], .post-preview') || img.closest('a[href*="/posts/"]') || img.parentElement,
 							getGalleryContainer: (root = document) => root.querySelector('#posts-container, .posts-container, #post-list'),
 							async fetchPost(id) {
 								const data = await BE.net.json(`${location.origin}/posts/${id}.json`);
@@ -622,6 +660,29 @@
 		return byImgId ? byImgId[0] : null;
 	}
 
+	// Follow-up review fix: try wrapper candidates in order of specificity
+	// and VALIDATE each one before accepting it, instead of trusting the
+	// first ancestor that matches any selector in the list. The generic
+	// [data-id]/[data-post-id] fallback in particular exists for
+	// Gelbooru-family mirror sites with non-standard markup, but is broad
+	// enough that it could match a container holding more than one post.
+	// A wrapper is only accepted if it holds exactly one thumbnail image
+	// and resolves to the SAME post ID as the image itself.
+	function gelbooruThumbWrapper(img) {
+		const selectors = ['.thumbnail-preview', 'article.thumbnail-preview', 'span.thumb', '.thumb', '[data-id]', '[data-post-id]'];
+		const imgId = gelbooruPostId(img);
+		for (const sel of selectors) {
+			let el;
+			try { el = img.closest(sel); } catch { continue; }
+			if (!el) continue;
+			if (el.querySelectorAll('img').length !== 1) continue; // more than one post's worth of content
+			const wrapId = gelbooruPostId(el);
+			if (imgId && wrapId && wrapId !== imgId) continue; // wrapper resolves to a different post
+			return el;
+		}
+		return img.closest('a') || img.parentElement;
+	}
+
 	let _gelbooruObservedPageSize = null;
 
 	BE.core.registerAdapter({
@@ -638,6 +699,15 @@
 								root,
 							),
 							getThumbPostId: (img) => gelbooruPostId(img),
+							// Requirement 3 (+ follow-up review): identify the
+							// actual post/card element, not an arbitrary
+							// "closest div" — and validate the candidate
+							// (exactly one thumbnail image, same resolved post
+							// ID as the image) before accepting it, since the
+							// [data-id]/[data-post-id] fallback used by some
+							// Gelbooru-family mirrors is otherwise too generic
+							// to trust blindly.
+							getThumbWrapper: (img) => gelbooruThumbWrapper(img),
 							getGalleryContainer: (root = document) => root.querySelector('#post-list-posts, #post-list, .content'),
 							async fetchPost(id) {
 								try {
@@ -700,9 +770,16 @@
 								calculateNextUrl(currentUrl) {
 									const u = safeURL(currentUrl);
 									if (!u) return null;
+									// Follow-up review fix: no more hard-coded "+42"
+									// guess. Only extrapolate a next page once we've
+									// actually observed a real page-size delta from a
+									// genuine next-page link (see getNextUrl above);
+									// otherwise report "no next page" so the caller
+									// falls back to the site's native pagination
+									// instead of fabricating a URL.
+									if (!_gelbooruObservedPageSize) return null;
 									const currentPid = parseInt(u.searchParams.get('pid') || '0', 10) || 0;
-									const pageSize = _gelbooruObservedPageSize || 42;
-									u.searchParams.set('pid', String(currentPid + pageSize));
+									u.searchParams.set('pid', String(currentPid + _gelbooruObservedPageSize));
 									return u.toString();
 								},
 								getPostIdentity(el) {
@@ -843,6 +920,7 @@
 								const href = a?.getAttribute('href') || '';
 								return (href.match(/\/post\/show\/(\d+)/) || [])[1] || null;
 							},
+							getThumbWrapper: (img) => img.closest('li, .post-preview, a.thumb') || img.parentElement,
 							getGalleryContainer: (root = document) => root.querySelector('#post-list-posts, #post-list, .content'),
 							async fetchPost(id) {
 								const data = await BE.net.json(`${location.origin}/post.json?tags=id:${id}`);
@@ -924,6 +1002,7 @@
 								const art = img.closest('article[id^="post_"]');
 								return art?.id?.match(/post_(\d+)/)?.[1] || (img.closest('a')?.getAttribute('href')?.match(/\/posts\/(\d+)/) || [])[1] || null;
 							},
+							getThumbWrapper: (img) => img.closest('article.post-preview, article[id^="post_"]') || img.closest('a') || img.parentElement,
 							getGalleryContainer: (root = document) => root.querySelector('#posts-container, .posts-container'),
 							async fetchPost(id) {
 								const data = await BE.net.json(`${location.origin}/posts/${id}.json`, {
@@ -1015,6 +1094,7 @@
 								const href = a?.getAttribute('href') || '';
 								return (href.match(/(\d{3,})/) || [])[0] || href || null;
 							},
+							getThumbWrapper: (img) => img.closest('.thumbnail, .post-thumbnail, a') || img.parentElement,
 							getGalleryContainer: (root = document) => root.querySelector('.content, #post-list, body'),
 							async fetchPost() {
 								const img = BE.dom.qs('#image, #main_image, .image-container img, main img.post-image');
@@ -1687,9 +1767,18 @@
 			galleryContainer.classList.add('be-gallery-grid');
 
 			// Event Delegation (attached exactly once per container).
-			galleryContainer.addEventListener('click', onGalleryClick, true);
-			galleryContainer.addEventListener('pointerover', onGalleryHover, true);
-			galleryContainer.addEventListener('pointerout', onGalleryHoverEnd, true);
+			// Requirement 4 / follow-up review: bubble phase, not capture.
+			// Capture-phase interception ran our logic before the site's own
+			// listeners on the thumbnail/link ever saw the event, which is
+			// more aggressive than necessary and risks interfering with
+			// Gelbooru's own click handling. Bubble phase still lets
+			// preventDefault() stop the default navigation (the browser
+			// only commits the default action after the whole dispatch,
+			// capture + target + bubble, completes) — we just no longer
+			// jump the queue ahead of the site's own handlers.
+			galleryContainer.addEventListener('click', onGalleryClick);
+			galleryContainer.addEventListener('pointerover', onGalleryHover);
+			galleryContainer.addEventListener('pointerout', onGalleryHoverEnd);
 
 			applyGridSettings();
 
@@ -1725,15 +1814,30 @@
 			const cols = BE.settings.get('gallery.gridDensity') || 0;
 			const thumbSize = BE.settings.get('gallery.thumbnailSize') || 220;
 			const gap = BE.settings.get('gallery.gridGap') ?? 8;
-			const compact = BE.settings.get('gallery.compactMode');
+			const compact = !!BE.settings.get('gallery.compactMode');
 
-			if (cols > 0) {
-				galleryContainer.style.setProperty('--be-grid-template', `repeat(${cols}, minmax(0, 1fr))`);
+			// Requirement 20: schema stores these as numbers already (the
+			// settings panel does Number(input.value) for range/number
+			// fields), but coerce defensively so a stale/corrupt stored
+			// string value can never become "300pxpx" below.
+			const thumbSizePx = Number(thumbSize) || 220;
+			const gapPx = Number(gap) || 0;
+			const colsNum = Number(cols) || 0;
+
+			// Requirement 12: --be-thumbnail-size is an actual consumed
+			// custom property now, not just a value baked into a template
+			// string — other rules (e.g. compact mode) can reference it too.
+			galleryContainer.style.setProperty('--be-thumbnail-size', `${thumbSizePx}px`);
+
+			if (colsNum > 0) {
+				galleryContainer.style.setProperty('--be-grid-template', `repeat(${colsNum}, minmax(0, 1fr))`);
 			} else {
-				galleryContainer.style.setProperty('--be-grid-template', `repeat(auto-fill, minmax(${thumbSize}px, 1fr))`);
+				galleryContainer.style.setProperty('--be-grid-template', `repeat(auto-fill, minmax(var(--be-thumbnail-size), 1fr))`);
 			}
-			galleryContainer.style.setProperty('--be-grid-gap', `${gap}px`);
+			galleryContainer.style.setProperty('--be-grid-gap', `${gapPx}px`);
 			galleryContainer.classList.toggle('be-compact-mode', compact);
+
+			BE.log.debug(`[Gallery] Grid: ${colsNum > 0 ? colsNum + ' columns' : 'auto'}, ${thumbSizePx}px, ${gapPx}px gap${compact ? ', compact' : ''}`);
 		}
 
 		function orderedPostIds() {
@@ -1799,22 +1903,58 @@
 			wrap.addEventListener('pointerleave', () => { bar.style.opacity = '0'; });
 		}
 
-		function enhanceThumbnails(root) {
-			const thumbs = BE.adapters.active.getThumbElements(root);
-			for (const img of thumbs) {
-				const wrap = img.closest('article, span, div, a') || img.parentElement;
-				if (wrap) {
-					wrap.classList.add('be-thumb-wrap');
-					if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
-					buildThumbActions(wrap, img);
-				}
-				img.classList.add('be-thumb-img');
-
-				const postId = BE.adapters.active.getThumbPostId(img);
-				if (postId) {
-					img.dataset.bePostId = postId;
+		// Requirement 3 / 29: resolve the actual per-post wrapper for a
+		// thumbnail <img> through the active adapter's getThumbWrapper (each
+		// adapter now provides one). This replaces the old
+		// img.closest('article, span, div, a') strategy, which was the
+		// common root cause behind several independent-looking symptoms:
+		// grabbing the wrong (too broad, or even the gallery-container-
+		// level) ancestor meant the sizing/no-overlap CSS landed on the
+		// wrong element, and click/hover delegation could end up treating
+		// "the whole gallery" as a single thumbnail.
+		function getWrapperForImg(img) {
+			const adapter = BE.adapters.active;
+			let wrap = null;
+			if (adapter && typeof adapter.getThumbWrapper === 'function') {
+				try { wrap = adapter.getThumbWrapper(img); } catch (err) {
+					BE.log.debug('[Gallery] getThumbWrapper threw, falling back', err);
 				}
 			}
+			if (!wrap) wrap = img.closest('a') || img.parentElement;
+			// Safety net: never accept the gallery container itself (or an
+			// ancestor of it) as "a thumbnail wrapper" — that would make a
+			// single wrapper swallow the entire gallery.
+			if (!wrap || wrap === galleryContainer || (galleryContainer && wrap.contains(galleryContainer))) {
+				return null;
+			}
+			return wrap;
+		}
+
+		// Single helper for enhancing one thumbnail — used for both the
+		// initial gallery render and dynamically-inserted (infinite scroll)
+		// thumbnails, per Requirement 17, so the two paths can never drift
+		// out of sync with each other.
+		function enhanceThumbnail(img) {
+			const wrap = getWrapperForImg(img);
+			if (wrap) {
+				wrap.classList.add('be-thumb-wrap');
+				if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+				buildThumbActions(wrap, img);
+			}
+			img.classList.add('be-thumb-img');
+
+			const postId = BE.adapters.active.getThumbPostId(img);
+			if (postId) {
+				img.dataset.bePostId = postId;
+			}
+			return wrap;
+		}
+
+		function enhanceThumbnails(root) {
+			const thumbs = BE.adapters.active.getThumbElements(root);
+			BE.log.debug(`[Gallery] Adapter: ${BE.adapters.active?.id}`);
+			BE.log.debug(`[Gallery] Thumbnails: ${thumbs.length}`);
+			for (const img of thumbs) enhanceThumbnail(img);
 		}
 
 		async function handleThumbAction(action, img, thumb) {
@@ -1856,6 +1996,7 @@
 				if (img) {
 					e.preventDefault();
 					e.stopPropagation();
+					BE.log.debug(`[Gallery] action button: ${actionBtn.dataset.beAction}`);
 					handleThumbAction(actionBtn.dataset.beAction, img, wrap);
 				}
 				return;
@@ -1867,27 +2008,47 @@
 			// browser/site handle "open in new tab", "open in background", etc.
 			if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
 
-			const thumb = e.target.closest('.be-thumb-wrap, article, span.thumb, a.thumb, .post-preview');
+			// Requirement 3/29: only ever recognize an element we've
+			// explicitly marked as a thumbnail wrapper. The old fallback
+			// list (article, span.thumb, a.thumb, .post-preview) could
+			// match an unrelated ancestor — including, in the worst case,
+			// the gallery container itself — and silently open the viewer
+			// for the wrong post (or make clicks appear to do nothing).
+			const thumb = e.target.closest('.be-thumb-wrap');
 			if (!thumb) return;
 
-			const img = thumb.matches('img') ? thumb : thumb.querySelector('img');
+			const img = thumb.matches('img') ? thumb : (thumb.querySelector('.be-thumb-img') || thumb.querySelector('img'));
 			if (!img) return;
 
 			e.preventDefault();
 			e.stopPropagation();
+			BE.log.debug(`[Gallery] Viewer opening post #${img.dataset.bePostId || BE.adapters.active.getThumbPostId(img)}`);
 			openViewerForThumb(img, thumb);
 		}
 
 		function onGalleryHover(e) {
 			if (!BE.settings.get('media.hoverPreview')) return;
-			const thumb = e.target.closest('.be-thumb-wrap, article, span.thumb, a.thumb, .post-preview');
+			const thumb = e.target.closest('.be-thumb-wrap');
 			if (!thumb) return;
-			const img = thumb.matches('img') ? thumb : thumb.querySelector('img');
+			// pointerover bubbles for every child element boundary inside
+			// the thumbnail (image, action bar, etc). Only (re)trigger the
+			// preview the first time we enter THIS wrapper, not on every
+			// bubble — this is what was causing the reported flicker.
+			if (thumb.dataset.beHovering === '1') return;
+			thumb.dataset.beHovering = '1';
+			const img = thumb.matches('img') ? thumb : (thumb.querySelector('.be-thumb-img') || thumb.querySelector('img'));
 			if (img) BE.modules.hover.show(img);
 		}
 
-		function onGalleryHoverEnd() {
+		function onGalleryHoverEnd(e) {
 			if (!BE.settings.get('media.hoverPreview')) return;
+			const thumb = e.target.closest('.be-thumb-wrap');
+			if (!thumb) return;
+			// Only actually hide once the pointer has left the wrapper
+			// entirely — relatedTarget still inside it means this pointerout
+			// was just an internal child boundary crossing.
+			if (thumb.contains(e.relatedTarget)) return;
+			delete thumb.dataset.beHovering;
 			BE.modules.hover.hide();
 		}
 
@@ -2059,16 +2220,36 @@
 
 					loadedPostIds.add(postId);
 
-					const wrap = thumb.closest('article, span, div, a') || thumb.parentElement;
+					// Requirement 17: same wrapper-resolution path as the
+					// initial thumbnails — no separate/duplicated logic.
+					// Note getWrapperForImg's "don't return the gallery
+					// container" guard doesn't apply to this parsed-doc
+					// element (it belongs to a detached document, not the
+					// live one), so it's safe to reuse directly here.
+					const wrap = (BE.adapters.active.getThumbWrapper && BE.adapters.active.getThumbWrapper(img)) || img.closest('a') || img.parentElement;
 					if (!wrap) continue;
 
 					const clonedWrap = wrap.cloneNode(true);
+					const clonedImg = clonedWrap.tagName === 'IMG' ? clonedWrap : clonedWrap.querySelector('img');
+					if (!clonedImg) continue;
+
 					clonedWrap.classList.add('be-thumb-wrap');
-					const clonedImg = clonedWrap.querySelector('img') || clonedWrap;
 					clonedImg.classList.add('be-thumb-img');
 					clonedImg.dataset.bePostId = postId;
 
+					// Requirement 18: cloneNode never carries over JS event
+					// state — the per-thumbnail hover action bar (built via
+					// direct pointerenter/pointerleave listeners, not
+					// delegation) would otherwise silently stop working on
+					// every dynamically-inserted thumbnail. Drop the cloned
+					// (dead) bar and rebuild it for real once attached.
+					const staleActions = clonedWrap.querySelector('.be-thumb-actions');
+					if (staleActions) staleActions.remove();
+
 					galleryContainer.appendChild(clonedWrap);
+					if (getComputedStyle(clonedWrap).position === 'static') clonedWrap.style.position = 'relative';
+					buildThumbActions(clonedWrap, clonedImg);
+
 					inserted++;
 				}
 				BE.log.debug(`[Gallery] unique posts: ${inserted}`);
@@ -2147,6 +2328,20 @@
 				background: rgba(128,128,128,0.1);
 				border-radius: 4px;
 			}
+			/* Requirement 11–16: now that .be-thumb-wrap is reliably the
+			   actual CSS grid item (not some unrelated ancestor), make sure
+			   OUR grid sizing is what visibly governs it — many booru sites
+			   give the equivalent native element a fixed width/float, which
+			   would otherwise silently override grid-template-columns and
+			   make thumbnailSize/gridDensity/gridGap changes invisible. */
+			.be-gallery-grid > .be-thumb-wrap,
+			.be-gallery-grid .be-thumb-wrap {
+				float: none !important;
+				width: 100% !important;
+				height: auto !important;
+				max-width: none !important;
+				margin: 0 !important;
+			}
 			.be-thumb-img {
 				display: block;
 				width: 100%;
@@ -2154,6 +2349,20 @@
 				max-width: 100%;
 				max-height: 100%;
 				object-fit: contain;
+			}
+			/* gallery.compactMode: previously toggled with no CSS consumer,
+			   so it "saved" but never visibly did anything. */
+			.be-gallery-grid.be-compact-mode .be-thumb-wrap {
+				aspect-ratio: 1/1;
+				border-radius: 2px;
+			}
+			.be-gallery-grid.be-compact-mode .be-thumb-actions {
+				padding: 1px;
+				gap: 2px;
+			}
+			.be-gallery-grid.be-compact-mode .be-thumb-action-btn {
+				padding: 1px 4px;
+				font-size: 10px;
 			}
 			.be-pagination-hidden {
 				display: none !important;
